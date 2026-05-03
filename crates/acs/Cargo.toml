@@ -1,0 +1,10 @@
+[package]
+name = "acs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+metal = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
