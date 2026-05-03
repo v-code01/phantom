@@ -1,0 +1,13 @@
+[package]
+name = "phantom"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "phantom"
+path = "src/main.rs"
+
+[dependencies]
+api       = { path = "../api" }
+scheduler = { path = "../scheduler" }
+tokio     = { workspace = true }

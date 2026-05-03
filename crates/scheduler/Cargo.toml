@@ -1,0 +1,10 @@
+[package]
+name = "scheduler"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+acs       = { path = "../acs" }
+kv        = { path = "../kv" }
+coherence = { path = "../coherence" }
+router    = { path = "../router" }

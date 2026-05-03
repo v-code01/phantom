@@ -1,0 +1,11 @@
+[package]
+name = "bench"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+acs = { path = "../acs" }
+kv  = { path = "../kv" }
+
+[dev-dependencies]
+proptest = { workspace = true }
