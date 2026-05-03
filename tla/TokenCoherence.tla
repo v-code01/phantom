@@ -1,7 +1,8 @@
 ---------------------------- MODULE TokenCoherence ----------------------------
 \* PHANTOM Token Coherence Protocol
 \* Seeds from: arXiv 2603.15183 (Parakhin, March 2026)
-\* Invariants I4/I5 stubbed here; proved in M3.
+\* Extensions: I2 (causal ordering) and I5 (atomic context injection) stubbed;
+\*             proved in M3 and M1 respectively.
 
 EXTENDS Naturals, FiniteSets
 
@@ -23,6 +24,10 @@ VARIABLES
     seen      \* [Agents -> [Artifacts -> Nat]]
 
 vars == <<mstate, ver, owner, sharers, seen>>
+
+\* State constraint: bound ver to keep TLC state space finite.
+\* K+2 is sufficient to exercise KBound violations without infinite exploration.
+VerBound == \A a \in Artifacts : ver[a] <= K + 2
 
 TypeOK ==
     /\ mstate  \in [Artifacts -> {"M", "E", "S", "I"}]
@@ -60,6 +65,9 @@ Write(ag, a) ==
     /\ seen'   = [seen   EXCEPT ![ag][a] = ver[a] + 1]
     /\ UNCHANGED <<owner, sharers>>
 
+\* Writeback: M→E (retain exclusive ownership after write; not eviction).
+\* Standard MESI evicts M→I; PHANTOM retains the cache line in E for reuse.
+\* To evict, call Writeback then Invalidate.
 Writeback(a) ==
     /\ mstate[a] = "M"
     /\ mstate' = [mstate EXCEPT ![a] = "E"]
@@ -85,8 +93,11 @@ SWMR ==
     \A a \in Artifacts :
         mstate[a] \in {"M", "E"} => sharers[a] = {}
 
-MonoVer ==
-    \A a \in Artifacts : ver[a] >= 0
+\* SeenBound: each agent's last-seen version never exceeds the current version.
+\* This is non-trivial (both ver and seen are Nat) and catches corruption bugs
+\* where seen is written past ver, which would make KBound subtraction unsound.
+SeenBound ==
+    \A ag \in Agents, a \in Artifacts : seen[ag][a] <= ver[a]
 
 KBound ==
     \A ag \in Agents, a \in Artifacts :
@@ -98,6 +109,16 @@ OwnerConsistency ==
     /\ \A a \in Artifacts :
         mstate[a] \in {"I", "S"} => owner[a] = None
 
-Invariants == SWMR /\ MonoVer /\ KBound /\ OwnerConsistency
+\* I2: Causal ordering — stub for M3 proof
+\* Events within an agent's history must be causally ordered.
+\* Full definition deferred to M3; TRUE here allows M0 TLC to pass.
+I2 == TRUE
+
+\* I5: Atomic context injection — stub for M1 proof
+\* A context write must be visible to all agents atomically before the next step.
+\* Full definition deferred to M1; TRUE here allows M0 TLC to pass.
+I5 == TRUE
+
+Invariants == SWMR /\ SeenBound /\ KBound /\ OwnerConsistency
 
 =============================================================================
