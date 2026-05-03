@@ -21,9 +21,10 @@ import subprocess
 import sys
 import time
 import concurrent.futures
-import statistics
 from dataclasses import dataclass, asdict
 from typing import Optional
+
+import numpy as np
 import requests
 
 
@@ -71,14 +72,22 @@ def host_info() -> dict:
     return {"macos": mac_ver, "chip": chip, "memory_gb": mem_gb}
 
 
+def git_sha() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL
+        ).decode().strip()
+    except Exception:
+        return "unknown"
+
+
 @dataclass
 class AgentResult:
     agent_id: int
-    prompt_tokens: int
-    completion_tokens: int
+    prompt_tokens: int        # word-split approximation; BPE ≈ 1.3x word count
+    completion_tokens: int    # word-split approximation; BPE ≈ 1.3x word count
     ttft_ms: float
     total_ms: float
-    token_count: int
 
 
 @dataclass
@@ -87,9 +96,10 @@ class BenchResult:
     model: str
     seed: int
     num_agents: int
-    context_tokens_per_agent: int
+    estimated_context_tokens: int  # approximate BPE token count for shared document
     timestamp: str
     host: dict
+    script_git_sha: str            # git SHA of benchmark script at run time
     agent_results: list
     p50_ttft_ms: float
     p95_ttft_ms: float
@@ -97,6 +107,8 @@ class BenchResult:
     p50_total_ms: float
     p95_total_ms: float
     total_tokens: int
+    throughput_tok_per_sec: float  # completion tokens / wall-clock seconds at peak concurrency
+    failed_agents: int             # number of agent requests that raised exceptions
     broadcast_duplication_pct: float
 
 
@@ -106,6 +118,20 @@ def check_server(base_url: str, timeout: float = 2.0) -> bool:
         return r.status_code == 200
     except Exception:
         return False
+
+
+def warmup(base_url: str, model: str) -> None:
+    """Single warmup request to prime model cache and Metal kernels."""
+    try:
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 4,
+            "stream": False,
+        }
+        requests.post(f"{base_url}/chat/completions", json=payload, timeout=60)
+    except Exception:
+        pass  # warmup failure is non-fatal
 
 
 def run_agent(base_url: str, model: str, agent_id: int,
@@ -140,6 +166,7 @@ def run_agent(base_url: str, model: str, agent_id: int,
                 chunks.append(delta)
     total_ms = (time.perf_counter() - t0) * 1000
     completion = "".join(chunks)
+    # word-split approximation; BPE ≈ 1.3x word count
     prompt_tokens = len(shared_doc.split()) + len(prompt.split())
     return AgentResult(
         agent_id=agent_id,
@@ -147,7 +174,6 @@ def run_agent(base_url: str, model: str, agent_id: int,
         completion_tokens=len(completion.split()),
         ttft_ms=ttft_ms or total_ms,
         total_ms=total_ms,
-        token_count=len(completion.split()),
     )
 
 
@@ -158,7 +184,7 @@ def broadcast_duplication_pct(results: list[AgentResult]) -> float:
     return min(100.0, duplicated / total_tokens * 100) if total_tokens > 0 else 0.0
 
 
-def benchmark_system(name: str, cfg: dict, seed: int,
+def benchmark_system(name: str, cfg: dict, seed: int, sha: str,
                      dry_run: bool, host: dict) -> Optional[BenchResult]:
     print(f"\n{'='*60}\nSystem: {name}  Model: {cfg['model']}\n{'='*60}")
     if not check_server(cfg["base_url"]):
@@ -167,7 +193,12 @@ def benchmark_system(name: str, cfg: dict, seed: int,
     if dry_run:
         print(f"  [DRY RUN] server reachable, skipping inference")
         return None
+
+    print(f"  Warming up {name}...")
+    warmup(cfg["base_url"], cfg["model"])
+
     results = []
+    failed = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(AGENT_PROMPTS)) as executor:
         future_to_id = {
             executor.submit(run_agent, cfg["base_url"], cfg["model"], i,
@@ -181,27 +212,38 @@ def benchmark_system(name: str, cfg: dict, seed: int,
                 results.append(r)
                 print(f"  Agent {agent_id+1:02d}: TTFT={r.ttft_ms:.0f}ms  total={r.total_ms:.0f}ms")
             except Exception as e:
+                failed += 1
                 print(f"  Agent {agent_id+1:02d}: ERROR: {e}")
+
     if not results:
         return None
-    ttfts  = sorted(r.ttft_ms  for r in results)
-    totals = sorted(r.total_ms for r in results)
-    n = len(results)
+
+    ttfts_arr = np.array([r.ttft_ms for r in results])
+    totals_arr = np.array([r.total_ms for r in results])
+
+    # wall-clock is determined by the slowest concurrent agent (peak concurrency window)
+    wall_clock_s = float(np.max(totals_arr)) / 1000.0
+    total_completion_tokens = sum(r.completion_tokens for r in results)
+    throughput = total_completion_tokens / wall_clock_s if wall_clock_s > 0 else 0.0
+
     return BenchResult(
         system=name,
         model=cfg["model"],
         seed=seed,
-        num_agents=n,
-        context_tokens_per_agent=8192,
+        num_agents=len(results),
+        estimated_context_tokens=int(len(SHARED_DOCUMENT.split()) * 1.3),
         timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         host=host,
+        script_git_sha=sha,
         agent_results=[asdict(r) for r in results],
-        p50_ttft_ms=statistics.median(ttfts),
-        p95_ttft_ms=ttfts[int(n * 0.95)],
-        p99_ttft_ms=ttfts[int(n * 0.99)],
-        p50_total_ms=statistics.median(totals),
-        p95_total_ms=totals[int(n * 0.95)],
-        total_tokens=sum(r.token_count for r in results),
+        p50_ttft_ms=float(np.percentile(ttfts_arr, 50)),
+        p95_ttft_ms=float(np.percentile(ttfts_arr, 95)),
+        p99_ttft_ms=float(np.percentile(ttfts_arr, 99)),
+        p50_total_ms=float(np.percentile(totals_arr, 50)),
+        p95_total_ms=float(np.percentile(totals_arr, 95)),
+        total_tokens=total_completion_tokens,
+        throughput_tok_per_sec=throughput,
+        failed_agents=failed,
         broadcast_duplication_pct=broadcast_duplication_pct(results),
     )
 
@@ -224,14 +266,16 @@ def main():
         systems = {args.system: SYSTEMS[args.system]}
 
     host = host_info()
+    sha = git_sha()
     print(f"PHANTOM Baseline Benchmark")
     print(f"Host:   {host['chip']}, {host['memory_gb']} GB, macOS {host['macos']}")
-    print(f"Agents: {len(AGENT_PROMPTS)}  Context: 8K/agent  Seed: {args.seed}")
+    print(f"Agents: {len(AGENT_PROMPTS)}  Context: ~{int(len(SHARED_DOCUMENT.split()) * 1.3)} tokens (estimated)  Seed: {args.seed}")
     print(f"Model:  Llama 3.1 8B Q4_K_M  Dry-run: {args.dry_run}")
+    print(f"SHA:    {sha}")
 
     all_results = []
     for name, cfg in systems.items():
-        result = benchmark_system(name, cfg, args.seed, args.dry_run, host)
+        result = benchmark_system(name, cfg, args.seed, sha, args.dry_run, host)
         if result:
             all_results.append(asdict(result))
 
@@ -249,6 +293,7 @@ def main():
     print("\nSummary:")
     for r in all_results:
         print(f"  {r['system']:12s}  p50_ttft={r['p50_ttft_ms']:.0f}ms  "
+              f"throughput={r['throughput_tok_per_sec']:.1f} tok/s  "
               f"broadcast_dup={r['broadcast_duplication_pct']:.1f}%")
 
 
