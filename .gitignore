@@ -1,0 +1,8 @@
+/target/
+.DS_Store
+*.metallib
+*.air
+bench_results/*.json
+scripts/__pycache__/
+scripts/*.pyc
+.worktrees/
