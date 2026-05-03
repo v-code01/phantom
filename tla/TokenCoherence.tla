@@ -8,13 +8,12 @@ EXTENDS Naturals, FiniteSets
 CONSTANTS
     Agents,     \* finite set of agent identifiers
     Artifacts,  \* finite set of artifact identifiers
-    K           \* staleness bound (positive natural number)
+    K,          \* staleness bound (positive natural number)
+    None        \* sentinel value representing "no owner"; assigned in .cfg
 
 ASSUME K \in Nat /\ K >= 1
 ASSUME IsFiniteSet(Agents)    /\ Cardinality(Agents) >= 1
 ASSUME IsFiniteSet(Artifacts) /\ Cardinality(Artifacts) >= 1
-
-None == CHOOSE x : x \notin Agents
 
 VARIABLES
     mstate,   \* [Artifacts -> {"M", "E", "S", "I"}]
@@ -48,9 +47,10 @@ Acquire(ag, a) ==
 Read(ag, a) ==
     /\ mstate[a] \in {"E", "S"}
     /\ mstate'  = [mstate  EXCEPT ![a] = "S"]
+    /\ owner'   = [owner   EXCEPT ![a] = None]
     /\ sharers' = [sharers EXCEPT ![a] = sharers[a] \cup {ag}]
     /\ seen'    = [seen    EXCEPT ![ag][a] = ver[a]]
-    /\ UNCHANGED <<ver, owner>>
+    /\ UNCHANGED <<ver>>
 
 Write(ag, a) ==
     /\ mstate[a] = "E"
@@ -79,7 +79,7 @@ Next ==
     \/ \E a \in Artifacts : Writeback(a)
     \/ \E a \in Artifacts : Invalidate(a)
 
-Spec == Init /\ [][Next]_vars
+Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
 
 SWMR ==
     \A a \in Artifacts :
