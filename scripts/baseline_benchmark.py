@@ -20,6 +20,7 @@ import platform
 import subprocess
 import sys
 import time
+import concurrent.futures
 import statistics
 from dataclasses import dataclass, asdict
 from typing import Optional
@@ -167,15 +168,20 @@ def benchmark_system(name: str, cfg: dict, seed: int,
         print(f"  [DRY RUN] server reachable, skipping inference")
         return None
     results = []
-    for i, prompt in enumerate(AGENT_PROMPTS):
-        print(f"  Agent {i+1:02d}/{len(AGENT_PROMPTS)}...", end="", flush=True)
-        try:
-            r = run_agent(cfg["base_url"], cfg["model"], i,
-                          SHARED_DOCUMENT, prompt, seed)
-            results.append(r)
-            print(f" TTFT={r.ttft_ms:.0f}ms  total={r.total_ms:.0f}ms")
-        except Exception as e:
-            print(f" ERROR: {e}")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(AGENT_PROMPTS)) as executor:
+        future_to_id = {
+            executor.submit(run_agent, cfg["base_url"], cfg["model"], i,
+                            SHARED_DOCUMENT, AGENT_PROMPTS[i], seed): i
+            for i in range(len(AGENT_PROMPTS))
+        }
+        for future in concurrent.futures.as_completed(future_to_id):
+            agent_id = future_to_id[future]
+            try:
+                r = future.result()
+                results.append(r)
+                print(f"  Agent {agent_id+1:02d}: TTFT={r.ttft_ms:.0f}ms  total={r.total_ms:.0f}ms")
+            except Exception as e:
+                print(f"  Agent {agent_id+1:02d}: ERROR: {e}")
     if not results:
         return None
     ttfts  = sorted(r.ttft_ms  for r in results)
@@ -204,7 +210,7 @@ def main():
     parser = argparse.ArgumentParser(description="PHANTOM baseline benchmark")
     parser.add_argument("--seed",    type=int, default=42)
     parser.add_argument("--output",  type=str,
-                        default="bench_results/baseline.json")
+                        default=f"bench_results/baseline_{time.strftime('%Y-%m-%d')}.json")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--system",  type=str, default=None,
                         help=f"one of: {list(SYSTEMS)}")
