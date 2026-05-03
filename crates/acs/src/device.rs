@@ -43,6 +43,9 @@ mod tests {
         let device = system_device();
         let buf = shared_buffer(&device, 64);
         let ptr = buf.contents() as *mut u32;
+        // SAFETY: Metal guarantees page-aligned allocation for new_buffer, satisfying
+        // *mut u32 alignment. `buf` outlives `ptr` (same scope). No GPU command encoder
+        // is active so there is no concurrent GPU writer producing a data race.
         unsafe {
             *ptr = 0xDEAD_BEEF;
             assert_eq!(
