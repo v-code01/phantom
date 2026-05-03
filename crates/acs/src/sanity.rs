@@ -37,8 +37,9 @@ pub fn double_on_gpu(value: u32) -> u32 {
         .expect("failed to create compute pipeline state");
 
     let buf = device::shared_buffer(&dev, 4);
-    // SAFETY: Metal guarantees page-aligned allocation; buf outlives ptr (same scope);
-    // no GPU encoder is active yet so there is no concurrent GPU writer.
+    // SAFETY: StorageModeShared guarantees non-null contents pointer. Metal guarantees
+    // page-aligned allocation satisfying *mut u32 alignment. `buf` outlives `ptr`
+    // (same scope). No GPU encoder is active yet so there is no concurrent GPU writer.
     let ptr = buf.contents() as *mut u32;
     unsafe { *ptr = value; }
 
