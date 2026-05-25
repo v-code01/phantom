@@ -11,7 +11,6 @@ struct TrieNode {
     parent_idx: Option<usize>, // None if direct child of root
     #[allow(dead_code)]
     parent_key: u64,           // key this node is stored under in parent
-    #[allow(dead_code)]
     rc: u32,                   // active forks holding this block
     last_used: u64,            // monotonic clock for LRU
 }
@@ -184,7 +183,46 @@ impl<const B: usize> DualRadixTrie<B> {
         }
     }
 
-    // fork and evict_lru are added in Tasks 6 and 7.
+    /// Increment ref count on every matched node and return their BlockIds.
+    /// Zero memcpy — caller is responsible for CoW: if writing to a returned
+    /// block whose rc > 1, allocate a fresh block, copy, then call slab.decref.
+    pub fn fork(&mut self, tokens: &[TokenId]) -> Vec<BlockId> {
+        let clock = self.tick();
+        let mut result: Vec<BlockId> = Vec::new();
+        let mut current_parent: Option<usize> = None;
+
+        for chunk in tokens.chunks(B) {
+            if chunk.len() < B {
+                break;
+            }
+            let key = Self::hash_block(chunk);
+
+            let child_idx = {
+                let map = match current_parent {
+                    Some(p) => &self.arena[p].as_ref().unwrap().children,
+                    None => &self.root_children,
+                };
+                map.get(&key).copied()
+            };
+
+            match child_idx {
+                Some(idx)
+                    if self.arena[idx].as_ref().unwrap().tokens.as_ref() == chunk =>
+                {
+                    let node = self.arena[idx].as_mut().unwrap();
+                    node.rc += 1;
+                    node.last_used = clock;
+                    result.push(node.block_id);
+                    current_parent = Some(idx);
+                }
+                _ => break,
+            }
+        }
+
+        result
+    }
+
+    // evict_lru is added in Task 7.
 }
 
 impl<const B: usize> Default for DualRadixTrie<B> {
@@ -237,5 +275,39 @@ mod tests {
         let result = trie.lookup(&abd);
         assert_eq!(result.matched_tokens, 8, "first two blocks must match");
         assert_eq!(result.block_ids, vec![BlockId(0), BlockId(1)]);
+    }
+
+    #[test]
+    fn fork_returns_existing_block_ids() {
+        let mut trie = DualRadixTrie::<4>::new();
+        let tokens = seq::<4>(&[0, 1]);
+        let blocks = vec![BlockId(10), BlockId(11)];
+        trie.insert(&tokens, &blocks);
+        let forked = trie.fork(&tokens);
+        assert_eq!(forked, blocks, "fork must return same block ids as insert");
+    }
+
+    #[test]
+    fn fork_then_extend_independent() {
+        let mut trie = DualRadixTrie::<4>::new();
+        // Shared prefix: one block
+        let prefix = seq::<4>(&[0]);
+        trie.insert(&prefix, &[BlockId(0)]);
+
+        // Agent A forks and extends
+        trie.fork(&prefix);
+        let a_ext = [seq::<4>(&[0]), seq::<4>(&[1])].concat();
+        trie.insert(&a_ext, &[BlockId(0), BlockId(1)]);
+
+        // Agent B forks and extends differently
+        trie.fork(&prefix);
+        let b_ext = [seq::<4>(&[0]), seq::<4>(&[2])].concat();
+        trie.insert(&b_ext, &[BlockId(0), BlockId(2)]);
+
+        let a_result = trie.lookup(&a_ext);
+        assert_eq!(a_result.block_ids, vec![BlockId(0), BlockId(1)]);
+
+        let b_result = trie.lookup(&b_ext);
+        assert_eq!(b_result.block_ids, vec![BlockId(0), BlockId(2)]);
     }
 }
