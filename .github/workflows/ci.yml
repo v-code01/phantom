@@ -13,7 +13,7 @@ env:
 jobs:
   build-and-test:
     name: Build and test (macOS arm64)
-    runs-on: macos-latest
+    runs-on: macos-15
 
     steps:
       - name: Checkout
@@ -64,3 +64,17 @@ jobs:
       - name: Run TLC model checker
         run: |
           java -jar tla2tools.jar tla/TokenCoherence.tla -config tla/TokenCoherence.cfg
+
+  dafny-check:
+    name: Dafny I5 proof
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Dafny
+        run: brew install dafny
+
+      - name: Verify I5 invariant
+        run: dafny verify dafny/KvInvariant.dfy

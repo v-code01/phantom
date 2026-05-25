@@ -4,4 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-acs = { path = "../acs" }
+metal          = { workspace = true }
+xxhash-rust    = { version = "0.8", features = ["xxh3"] }
+
+[dev-dependencies]
+proptest = { workspace = true }
