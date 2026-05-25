@@ -7,9 +7,7 @@ struct TrieNode {
     tokens: Box<[TokenId]>,
     children: HashMap<u64, usize>, // hash(child.tokens) → arena index
     // Fields below are written now; read in Tasks 6 (fork) and 7 (evict_lru).
-    #[allow(dead_code)]
     parent_idx: Option<usize>, // None if direct child of root
-    #[allow(dead_code)]
     parent_key: u64,           // key this node is stored under in parent
     rc: u32,   // active forks holding this block; incremented by fork(),
                // decremented by evict_lru() (Task 7) / KvCache::release() (Task 9).
@@ -228,7 +226,52 @@ impl<const B: usize> DualRadixTrie<B> {
         result
     }
 
-    // evict_lru is added in Task 7.
+    /// Evict up to `target` leaf nodes (rc == 0, no children) sorted by
+    /// last_used ascending (oldest first). Returns the freed BlockIds so the
+    /// caller can decref the corresponding slab blocks.
+    pub fn evict_lru(&mut self, target: usize) -> Vec<BlockId> {
+        // Collect evictable: leaf nodes with rc == 0.
+        let mut evictable: Vec<(u64, usize)> = self
+            .arena
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| {
+                slot.as_ref()
+                    .filter(|n| n.rc == 0 && n.children.is_empty())
+                    .map(|n| (n.last_used, i))
+            })
+            .collect();
+        evictable.sort_unstable_by_key(|&(t, _)| t);
+
+        let mut freed = Vec::new();
+        for (_, idx) in evictable.into_iter().take(target) {
+            let node = self.arena[idx].take().unwrap();
+            freed.push(node.block_id);
+
+            // Unlink from parent — but guard against the collision-orphan case:
+            // a true xxh3 collision can cause a live node to overwrite the
+            // parent's child pointer. Only remove if the parent still maps
+            // node.parent_key to THIS node's index.
+            match node.parent_idx {
+                Some(parent_idx) => {
+                    if let Some(p) = self.arena[parent_idx].as_mut() {
+                        if p.children.get(&node.parent_key) == Some(&idx) {
+                            p.children.remove(&node.parent_key);
+                        }
+                    }
+                }
+                None => {
+                    if self.root_children.get(&node.parent_key) == Some(&idx) {
+                        self.root_children.remove(&node.parent_key);
+                    }
+                }
+            }
+
+            self.free_slots.push(idx);
+        }
+
+        freed
+    }
 }
 
 impl<const B: usize> Default for DualRadixTrie<B> {
@@ -315,5 +358,27 @@ mod tests {
 
         let b_result = trie.lookup(&b_ext);
         assert_eq!(b_result.block_ids, vec![BlockId(0), BlockId(2)]);
+    }
+
+    #[test]
+    fn evict_lru_skips_forked_nodes() {
+        let mut trie = DualRadixTrie::<4>::new();
+        let tokens = seq::<4>(&[0]);
+        trie.insert(&tokens, &[BlockId(0)]);
+        trie.fork(&tokens); // rc becomes 1
+        let freed = trie.evict_lru(10);
+        assert!(freed.is_empty(), "forked node (rc=1) must not be evicted");
+    }
+
+    #[test]
+    fn evict_lru_frees_oldest_first() {
+        let mut trie = DualRadixTrie::<4>::new();
+        // Three separate leaf nodes inserted in order; oldest has lowest clock.
+        trie.insert(&seq::<4>(&[0]), &[BlockId(0)]);
+        trie.insert(&seq::<4>(&[1]), &[BlockId(1)]);
+        trie.insert(&seq::<4>(&[2]), &[BlockId(2)]);
+        // Evict 1 → must free the oldest (BlockId(0), inserted first).
+        let freed = trie.evict_lru(1);
+        assert_eq!(freed, vec![BlockId(0)], "oldest leaf must be evicted first");
     }
 }
