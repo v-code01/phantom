@@ -11,7 +11,9 @@ struct TrieNode {
     parent_idx: Option<usize>, // None if direct child of root
     #[allow(dead_code)]
     parent_key: u64,           // key this node is stored under in parent
-    rc: u32,                   // active forks holding this block
+    rc: u32,   // active forks holding this block; incremented by fork(),
+               // decremented by evict_lru() (Task 7) / KvCache::release() (Task 9).
+               // A node with rc > 0 must never be evicted.
     last_used: u64,            // monotonic clock for LRU
 }
 
@@ -186,6 +188,10 @@ impl<const B: usize> DualRadixTrie<B> {
     /// Increment ref count on every matched node and return their BlockIds.
     /// Zero memcpy — caller is responsible for CoW: if writing to a returned
     /// block whose rc > 1, allocate a fresh block, copy, then call slab.decref.
+    ///
+    /// The caller must eventually decrement rc for each forked node (via a
+    /// future `release` / `evict_lru` path). A node with rc > 0 is structurally
+    /// immutable and must never be evicted.
     pub fn fork(&mut self, tokens: &[TokenId]) -> Vec<BlockId> {
         let clock = self.tick();
         let mut result: Vec<BlockId> = Vec::new();
@@ -210,7 +216,7 @@ impl<const B: usize> DualRadixTrie<B> {
                     if self.arena[idx].as_ref().unwrap().tokens.as_ref() == chunk =>
                 {
                     let node = self.arena[idx].as_mut().unwrap();
-                    node.rc += 1;
+                    node.rc = node.rc.checked_add(1).expect("TrieNode rc overflow");
                     node.last_used = clock;
                     result.push(node.block_id);
                     current_parent = Some(idx);
