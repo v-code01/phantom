@@ -451,4 +451,24 @@ mod tests {
             }
         }
     }
+
+    /// evict_lru never evicts an interior node that was forked (rc > 0, has children).
+    /// This covers the case where `children.is_empty()` is the evictable filter —
+    /// verifying that rc > 0 on interior nodes is independently respected.
+    #[test]
+    fn evict_lru_skips_interior_forked_node() {
+        let mut trie = DualRadixTrie::<4>::new();
+        // Build a 2-node chain: root → node A → node B
+        let ab = seq::<4>(&[0, 1]);
+        trie.insert(&ab, &[BlockId(10), BlockId(11)]);
+        // Fork the prefix (node A becomes rc=1 and has node B as child)
+        trie.fork(&seq::<4>(&[0]));
+        // Attempt to evict everything
+        let freed = trie.evict_lru(10);
+        // Node B (leaf, rc=0) may be evicted; node A (interior, rc=1) must not be
+        assert!(
+            !freed.contains(&BlockId(10)),
+            "interior forked node A must not be evicted even if rc guard were absent"
+        );
+    }
 }
