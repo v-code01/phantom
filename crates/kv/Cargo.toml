@@ -8,5 +8,4 @@ metal          = { workspace = true }
 xxhash-rust    = { version = "0.8", features = ["xxh3"] }
 
 [dev-dependencies]
-acs      = { path = "../acs" }
 proptest = { workspace = true }

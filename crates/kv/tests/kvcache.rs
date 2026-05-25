@@ -69,7 +69,7 @@ fn full_workflow() {
     assert_eq!(cache.free_count(), 4, "4 of 8 blocks must be in use before eviction");
 
     // ── Evict 1 block (oldest rc=0 leaf) ─────────────────────────────────
-    // Slab used: blocks 0,1 (shared, rc=2 each), block 2 (A ext, rc=0),
+    // Slab used: blocks 0,1 (shared, trie rc=2 each after two forks),
     //            block 3 (B ext, rc=0). free_count = 8 - 4 = 4.
     let free_before = cache.free_count();
     let freed = cache.evict(1);

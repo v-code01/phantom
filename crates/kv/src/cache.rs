@@ -1,19 +1,13 @@
 use crate::{
     block::BlockSlab,
     trie::DualRadixTrie,
-    BlockId, TokenId,
+    BlockId, LookupResult, TokenId,
 };
 
 #[derive(Debug)]
 pub enum CacheError {
     OutOfBlocks,
     DataSizeMismatch,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct LookupResult {
-    pub matched_tokens: usize,
-    pub block_ids: Vec<BlockId>,
 }
 
 pub struct KvCache<const B: usize> {
@@ -91,7 +85,17 @@ impl<const B: usize> KvCache<B> {
         Ok(())
     }
 
-    /// CoW fork: increment ref counts on shared prefix blocks, return their ids.
+    /// CoW fork: increment ref counts on shared prefix trie nodes and return their
+    /// block ids. Zero memcpy — the caller receives the same `BlockId`s as the
+    /// inserted sequence.
+    ///
+    /// # M1 limitation
+    /// This method increments the trie-internal `rc` field on matched nodes but
+    /// does NOT call `BlockSlab::incref`. The trie `rc` is the sole guard against
+    /// premature eviction at M1. Callers that hold a `Vec<BlockId>` from this
+    /// method must not free those blocks via any path that bypasses `KvCache::evict`.
+    /// M3 will add a symmetric `release` operation that decrements both trie `rc`
+    /// and slab ref counts.
     pub fn fork(&mut self, tokens: &[TokenId]) -> Vec<BlockId> {
         self.trie.fork(tokens)
     }

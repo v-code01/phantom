@@ -79,6 +79,12 @@ impl<const B: usize> BlockSlab<B> {
         Some(id)
     }
 
+    /// Increment the reference count for `id`.
+    ///
+    /// At M1 `KvCache::fork` tracks fork counts via the trie's `rc` field and does
+    /// NOT call this method; the slab ref count is always 1 for every live block.
+    /// M3 will wire `incref`/`decref` symmetrically with fork/release so the slab
+    /// layer becomes the authoritative reference-count source.
     pub fn incref(&self, id: BlockId) {
         self.ref_counts[id.0].fetch_add(1, Ordering::Relaxed);
     }
@@ -193,5 +199,56 @@ mod tests {
         let ptr = slab.block_ptr(id).expect("committed block must be readable");
         let read_back = unsafe { std::slice::from_raw_parts(ptr, 8) };
         assert_eq!(read_back, data.as_slice(), "bytes written must be bytes read");
+    }
+
+    #[test]
+    #[ignore = "requires Apple Silicon hardware with Metal support"]
+    fn mtlbuffer_shared_ptr_nonzero() {
+        let device = metal::Device::system_default()
+            .expect("no Metal device: run on Apple Silicon");
+        let mut slab = BlockSlab::<4>::new(&device, 1, 2);
+        // On real hardware the shared-mode buffer pointer must be non-null.
+        // alloc returns a BlockId; the underlying buffer ptr is stored as data_ptr.
+        let _id = slab.alloc().expect("alloc on fresh slab");
+        // We cannot access data_ptr directly from tests, but we can verify
+        // commit_block round-trips correctly through the Metal buffer.
+        let data = [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04u8];
+        unsafe { slab.commit_block(_id, data.as_ptr()); }
+        let ptr = slab.block_ptr(_id).expect("committed block must be readable");
+        let read_back = unsafe { std::slice::from_raw_parts(ptr, 8) };
+        assert_eq!(read_back, &data, "Metal shared buffer round-trip must preserve bytes");
+    }
+
+    #[test]
+    #[ignore = "requires Apple Silicon hardware with Metal support"]
+    fn cpu_write_gpu_visible() {
+        // Verify that bytes written through the shared pointer are in the buffer
+        // that Metal would read. We can't submit a GPU command here without a
+        // command queue, but we can verify the pointer returned by block_ptr is
+        // within the Metal buffer's address range.
+        let device = metal::Device::system_default()
+            .expect("no Metal device: run on Apple Silicon");
+        let mut slab = BlockSlab::<4>::new(&device, 2, 2);
+        let id0 = slab.alloc().unwrap();
+        let id1 = slab.alloc().unwrap();
+        let data0 = [0xAAu8; 8];
+        let data1 = [0xBBu8; 8];
+        unsafe {
+            slab.commit_block(id0, data0.as_ptr());
+            slab.commit_block(id1, data1.as_ptr());
+        }
+        let ptr0 = slab.block_ptr(id0).unwrap();
+        let ptr1 = slab.block_ptr(id1).unwrap();
+        // Blocks must be adjacent: ptr1 == ptr0 + B * element_stride
+        let expected_stride = 4 * 2; // B=4, element_stride=2
+        assert_eq!(
+            ptr1 as usize,
+            ptr0 as usize + expected_stride,
+            "Metal buffer blocks must be contiguous at stride B * element_stride"
+        );
+        let read0 = unsafe { std::slice::from_raw_parts(ptr0, 8) };
+        let read1 = unsafe { std::slice::from_raw_parts(ptr1, 8) };
+        assert_eq!(read0, &data0);
+        assert_eq!(read1, &data1);
     }
 }
