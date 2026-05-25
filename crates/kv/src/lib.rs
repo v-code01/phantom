@@ -4,7 +4,8 @@ pub mod trie;
 
 pub use block::BlockError;
 pub use cache::{CacheError, LookupResult};
-// KvCache re-exported in Task 9; DualRadixTrie re-exported in Task 5.
+pub use trie::DualRadixTrie;
+// KvCache re-exported in Task 9.
 
 pub type TokenId = u32;
 

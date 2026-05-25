@@ -7,7 +7,7 @@ pub enum BlockError {
 }
 
 enum BlockSlabBacking {
-    #[cfg_attr(test, allow(dead_code))]
+    #[allow(dead_code)] // Buffer held for its lifetime; only destructured on drop
     Metal(metal::Buffer),
     #[allow(dead_code)] // owned solely to keep the heap allocation alive
     Heap(Box<[u8]>),
