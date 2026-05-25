@@ -64,6 +64,10 @@ fn full_workflow() {
         "each agent's extension must use a distinct block"
     );
 
+    // Verify slab accounting: 4 blocks in use (2 shared + 1 per agent extension).
+    // free_count starts at 8; 4 blocks allocated → 4 free.
+    assert_eq!(cache.free_count(), 4, "4 of 8 blocks must be in use before eviction");
+
     // ── Evict 1 block (oldest rc=0 leaf) ─────────────────────────────────
     // Slab used: blocks 0,1 (shared, rc=2 each), block 2 (A ext, rc=0),
     //            block 3 (B ext, rc=0). free_count = 8 - 4 = 4.

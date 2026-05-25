@@ -9,9 +9,10 @@ struct TrieNode {
     // Fields below are written now; read in Tasks 6 (fork) and 7 (evict_lru).
     parent_idx: Option<usize>, // None if direct child of root
     parent_key: u64,           // key this node is stored under in parent
-    rc: u32,   // active forks holding this block; incremented by fork(),
-               // decremented by evict_lru() (Task 7) / KvCache::release() (Task 9).
-               // A node with rc > 0 must never be evicted.
+    rc: u32,   // active forks holding this block; incremented by fork().
+               // A node is eligible for eviction only when rc == 0 and it has no
+               // children. rc is never explicitly decremented; nodes are dropped
+               // from the arena entirely when evict_lru removes them.
     last_used: u64,            // monotonic clock for LRU
 }
 

@@ -29,6 +29,9 @@ impl<const B: usize> KvCache<B> {
         }
     }
 
+    /// CPU-only variant backed by a heap allocation instead of a Metal buffer.
+    /// Intended for unit tests and environments without an MTLDevice.
+    /// GPU visibility is not provided — do not use for production inference.
     pub fn new_heap(capacity: usize, element_stride: usize) -> Self {
         Self {
             slab: BlockSlab::new_heap(capacity, element_stride),
@@ -57,19 +60,30 @@ impl<const B: usize> KvCache<B> {
         let skip_blocks = existing.matched_tokens / B;
         let mut allocated: Vec<BlockId> = existing.block_ids;
 
+        let mut newly_allocated: Vec<BlockId> = Vec::new();
         for kv in &kv_data[skip_blocks..] {
-            let id = self.slab.alloc().ok_or(CacheError::OutOfBlocks)?;
-            // Assert the caller-provided slice is exactly the right size before
-            // committing. On mismatch, decref to avoid a slab leak then return.
+            let id = match self.slab.alloc() {
+                Some(id) => id,
+                None => {
+                    for &leaked in &newly_allocated {
+                        self.slab.decref(leaked);
+                    }
+                    return Err(CacheError::OutOfBlocks);
+                }
+            };
             if kv.len() != B * self.slab.element_stride {
                 self.slab.decref(id);
+                for &leaked in &newly_allocated {
+                    self.slab.decref(leaked);
+                }
                 return Err(CacheError::DataSizeMismatch);
             }
             // SAFETY: kv is a caller-provided slice of exactly B * element_stride
             // bytes (verified above). commit_block reads that many bytes from src.
             unsafe { self.slab.commit_block(id, kv.as_ptr()); }
-            allocated.push(id);
+            newly_allocated.push(id);
         }
+        allocated.extend(newly_allocated);
 
         // Pass the full allocated vec (prefix ids + new ids) so the trie can
         // walk the existing prefix edges and insert only the new tail nodes.
