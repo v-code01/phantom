@@ -396,4 +396,59 @@ mod tests {
         assert_eq!(trie.lookup(&seq::<4>(&[1])).matched_tokens, 4);
         assert_eq!(trie.lookup(&seq::<4>(&[2])).matched_tokens, 4);
     }
+
+    // ── Property tests ────────────────────────────────────────────────────
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Any sequence of blocks inserted into the trie is always fully found
+        /// on a subsequent lookup.
+        #[test]
+        fn prop_insert_lookup_roundtrip(n_blocks in 1usize..=8) {
+            let mut trie = DualRadixTrie::<4>::new();
+            // Use index-based tokens to guarantee unique blocks.
+            let tokens: Vec<u32> = (0..(n_blocks * 4) as u32).collect();
+            let block_ids: Vec<BlockId> = (0..n_blocks).map(BlockId).collect();
+            trie.insert(&tokens, &block_ids);
+            let result = trie.lookup(&tokens);
+            prop_assert_eq!(result.matched_tokens, n_blocks * 4);
+            prop_assert_eq!(result.block_ids, block_ids);
+        }
+
+        /// fork returns the same BlockIds that were provided at insert time.
+        #[test]
+        fn prop_fork_same_block_ids(n_blocks in 1usize..=6) {
+            let mut trie = DualRadixTrie::<4>::new();
+            let tokens: Vec<u32> = (0..(n_blocks * 4) as u32).collect();
+            let block_ids: Vec<BlockId> = (0..n_blocks).map(BlockId).collect();
+            trie.insert(&tokens, &block_ids);
+            let forked = trie.fork(&tokens);
+            prop_assert_eq!(forked, block_ids);
+        }
+
+        /// evict_lru never returns a BlockId whose node had rc > 0.
+        #[test]
+        fn prop_evict_never_touches_rc_nonzero(n_blocks in 1usize..=8) {
+            let mut trie = DualRadixTrie::<4>::new();
+            let mut forked_ids: Vec<BlockId> = Vec::new();
+            for i in 0..n_blocks {
+                // Each block gets 4 unique tokens based on its index.
+                let tokens: Vec<u32> = (i as u32 * 4..i as u32 * 4 + 4).collect();
+                trie.insert(&tokens, &[BlockId(i)]);
+                if i % 2 == 0 {
+                    trie.fork(&tokens);
+                    forked_ids.push(BlockId(i));
+                }
+            }
+            let freed = trie.evict_lru(n_blocks * 2);
+            for fid in &forked_ids {
+                prop_assert!(
+                    !freed.contains(fid),
+                    "forked block {:?} must not be evicted",
+                    fid
+                );
+            }
+        }
+    }
 }
