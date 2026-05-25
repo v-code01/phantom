@@ -44,7 +44,10 @@ impl<const B: usize> BlockSlab<B> {
 
     #[cfg(test)]
     pub fn new_heap(capacity: usize, element_stride: usize) -> Self {
-        let size_bytes = capacity * B * element_stride;
+        let size_bytes = capacity
+            .checked_mul(B)
+            .and_then(|x| x.checked_mul(element_stride))
+            .expect("BlockSlab size overflow");
         let mut heap = vec![0u8; size_bytes].into_boxed_slice();
         let data_ptr = heap.as_mut_ptr();
         Self::from_raw(data_ptr, BlockSlabBacking::Heap(heap), capacity, element_stride)
