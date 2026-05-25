@@ -30,3 +30,15 @@ lemma FreePreservesI5(slab: seq<Block>, id: nat, stride: nat)
     requires 0 <= id < |slab|
     ensures  I5(slab[id := Block(slab[id].data, false)], stride)
 {}
+
+// Allocating a freed slot does not change any data or committed flags;
+// it only returns an index to the caller. I5 is trivially preserved.
+// The precondition !slab[id].committed is the machine-checked encoding of
+// the free-list contract: decref must reset committed=false before returning
+// a slot to the free list, making alloc safe to hand the slot to a new writer.
+lemma AllocPreservesI5(slab: seq<Block>, id: nat, stride: nat)
+    requires I5(slab, stride)
+    requires 0 <= id < |slab|
+    requires !slab[id].committed
+    ensures  I5(slab, stride)
+{}

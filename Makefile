@@ -1,4 +1,4 @@
-.PHONY: test test-hardware clippy build verify-tla benchmark clean
+.PHONY: test test-hardware clippy build verify-tla benchmark clean verify-dafny
 
 test:
 	cargo test --workspace
@@ -22,3 +22,7 @@ benchmark:
 
 clean:
 	cargo clean
+
+verify-dafny:
+	@command -v dafny >/dev/null 2>&1 || { echo "Dafny not found. Install: brew install dafny"; exit 1; }
+	dafny verify dafny/KvInvariant.dfy
