@@ -239,11 +239,13 @@ mod tests {
         }
         let ptr0 = slab.block_ptr(id0).unwrap();
         let ptr1 = slab.block_ptr(id1).unwrap();
-        // Blocks must be adjacent: ptr1 == ptr0 + B * element_stride
+        // Blocks must differ by exactly B * element_stride regardless of
+        // alloc order (free_list pops from the end, so id0 and id1 may not
+        // be BlockId(0)/BlockId(1) in ascending address order).
         let expected_stride = 4 * 2; // B=4, element_stride=2
         assert_eq!(
-            ptr1 as usize,
-            ptr0 as usize + expected_stride,
+            (ptr0 as usize).abs_diff(ptr1 as usize),
+            expected_stride,
             "Metal buffer blocks must be contiguous at stride B * element_stride"
         );
         let read0 = unsafe { std::slice::from_raw_parts(ptr0, 8) };
