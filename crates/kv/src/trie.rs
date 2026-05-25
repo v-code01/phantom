@@ -39,8 +39,11 @@ impl<const B: usize> DualRadixTrie<B> {
     }
 
     fn hash_block(tokens: &[TokenId]) -> u64 {
-        // SAFETY: TokenId is u32 (no padding in a slice of u32). Viewing the
-        // backing bytes as &[u8] is well-defined on all platforms.
+        // SAFETY: TokenId is u32 — no interior padding; size_of::<u32>() bytes
+        // are all value bytes. Viewing as &[u8] is well-defined.
+        // NOTE: byte order is native-endian. Hash values are not portable across
+        // hosts with different endianness; cached state must not be persisted
+        // across heterogeneous architectures.
         let bytes = unsafe {
             std::slice::from_raw_parts(
                 tokens.as_ptr() as *const u8,
@@ -148,7 +151,13 @@ impl<const B: usize> DualRadixTrie<B> {
                     current_parent = Some(idx);
                     continue;
                 }
-                // Hash collision with different tokens: fall through to insert.
+                // True xxh3 collision (different tokens, same 64-bit hash).
+                // The existing node is orphaned in the arena — its parent_key
+                // will still match `key`, but after the insert below the parent
+                // maps `key` to the new node's index. Task 7's evict_lru must
+                // guard against this: before removing from the parent's children
+                // map, verify parent.children[node.parent_key] == node's own
+                // arena index, and skip the remove if it doesn't match.
             }
 
             let new_node = TrieNode {
