@@ -41,7 +41,6 @@ impl<const B: usize> BlockSlab<B> {
         Self::from_raw(data_ptr, BlockSlabBacking::Metal(buffer), capacity, element_stride)
     }
 
-    #[cfg(test)]
     pub fn new_heap(capacity: usize, element_stride: usize) -> Self {
         let size_bytes = capacity
             .checked_mul(B)
