@@ -229,7 +229,16 @@ impl<const B: usize> DualRadixTrie<B> {
     /// Evict up to `target` leaf nodes (rc == 0, no children) sorted by
     /// last_used ascending (oldest first). Returns the freed BlockIds so the
     /// caller can decref the corresponding slab blocks.
+    ///
+    /// Uses a single-snapshot design: candidates are collected before any
+    /// mutations. A node whose last child is evicted in this call may become a
+    /// new leaf, but it will NOT be considered in the same call — a subsequent
+    /// `evict_lru` call is required. Deep single-child chains require repeated
+    /// calls to fully drain.
     pub fn evict_lru(&mut self, target: usize) -> Vec<BlockId> {
+        // O(n) arena scan — acceptable at M1 working-set sizes (thousands of
+        // blocks). Future: maintain a separate min-heap keyed by last_used for
+        // O(log n) eviction.
         // Collect evictable: leaf nodes with rc == 0.
         let mut evictable: Vec<(u64, usize)> = self
             .arena
@@ -380,5 +389,11 @@ mod tests {
         // Evict 1 → must free the oldest (BlockId(0), inserted first).
         let freed = trie.evict_lru(1);
         assert_eq!(freed, vec![BlockId(0)], "oldest leaf must be evicted first");
+        // Verify the evicted node is unlinked — lookup must return zero matches.
+        let result = trie.lookup(&seq::<4>(&[0]));
+        assert_eq!(result.matched_tokens, 0, "evicted node must be unreachable via lookup");
+        // Remaining two nodes must still be reachable.
+        assert_eq!(trie.lookup(&seq::<4>(&[1])).matched_tokens, 4);
+        assert_eq!(trie.lookup(&seq::<4>(&[2])).matched_tokens, 4);
     }
 }
