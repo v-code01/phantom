@@ -110,7 +110,37 @@ impl<const B: usize> BlockSlab<B> {
         self.free_list.len()
     }
 
-    // commit_block and block_ptr are added in Task 3.
+    /// Write `B * element_stride` bytes from `src` into block `id`, then set
+    /// the I5 committed flag with a SeqCst store so any subsequent reader
+    /// that loads `committed == true` is guaranteed to see all written bytes.
+    ///
+    /// # Safety
+    /// `src` must be valid for reads of `B * element_stride` bytes.
+    pub unsafe fn commit_block(&self, id: BlockId, src: *const u8) {
+        debug_assert!(id.0 < self.capacity, "BlockId {} out of range (capacity {})", id.0, self.capacity);
+        let dst = self.data_ptr.add(id.0 * B * self.element_stride);
+        std::ptr::copy_nonoverlapping(src, dst, B * self.element_stride);
+        // SeqCst store: ensures all preceding writes to the block data are
+        // visible to any reader that subsequently observes committed == true.
+        self.committed[id.0].store(true, Ordering::SeqCst);
+    }
+
+    /// Return a read-only pointer to the first byte of block `id`'s data.
+    ///
+    /// Returns `Err(BlockError::NotCommitted)` if the block has not yet had
+    /// `commit_block` called on it — enforcing the I5 invariant that no
+    /// reader sees a partially-written block.
+    pub fn block_ptr(&self, id: BlockId) -> Result<*const u8, BlockError> {
+        debug_assert!(id.0 < self.capacity, "BlockId {} out of range (capacity {})", id.0, self.capacity);
+        // SeqCst load pairs with the SeqCst store in commit_block, establishing
+        // a happens-before edge: all writes visible before the store are
+        // guaranteed visible after this load returns true.
+        if !self.committed[id.0].load(Ordering::SeqCst) {
+            return Err(BlockError::NotCommitted);
+        }
+        // SAFETY: id is within capacity; data_ptr is valid for the slab lifetime.
+        Ok(unsafe { self.data_ptr.add(id.0 * B * self.element_stride) })
+    }
 }
 
 #[cfg(test)]
@@ -139,5 +169,27 @@ mod tests {
         let _ = slab.alloc().unwrap();
         let _ = slab.alloc().unwrap();
         assert!(slab.alloc().is_none(), "third alloc from capacity-2 slab must return None");
+    }
+
+    #[test]
+    fn uncommitted_block_ptr_returns_err() {
+        let mut slab = BlockSlab::<4>::new_heap(1, 2);
+        let id = slab.alloc().unwrap();
+        assert!(
+            matches!(slab.block_ptr(id), Err(BlockError::NotCommitted)),
+            "block_ptr on uncommitted block must return Err(NotCommitted)"
+        );
+    }
+
+    #[test]
+    fn commit_write_read_roundtrip() {
+        let mut slab = BlockSlab::<4>::new_heap(1, 2);
+        let id = slab.alloc().unwrap();
+        // B=4, element_stride=2 → block size = 4 * 2 = 8 bytes
+        let data: Vec<u8> = (0u8..8).collect();
+        unsafe { slab.commit_block(id, data.as_ptr()); }
+        let ptr = slab.block_ptr(id).expect("committed block must be readable");
+        let read_back = unsafe { std::slice::from_raw_parts(ptr, 8) };
+        assert_eq!(read_back, data.as_slice(), "bytes written must be bytes read");
     }
 }
