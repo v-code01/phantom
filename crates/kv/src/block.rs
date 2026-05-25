@@ -30,7 +30,10 @@ unsafe impl<const B: usize> Send for BlockSlab<B> {}
 
 impl<const B: usize> BlockSlab<B> {
     pub fn new(device: &metal::Device, capacity: usize, element_stride: usize) -> Self {
-        let size_bytes = (capacity * B * element_stride) as u64;
+        let size_bytes = capacity
+            .checked_mul(B)
+            .and_then(|x| x.checked_mul(element_stride))
+            .expect("BlockSlab size overflow") as u64;
         let buffer = device.new_buffer(
             size_bytes,
             metal::MTLResourceOptions::StorageModeShared,
@@ -66,8 +69,12 @@ impl<const B: usize> BlockSlab<B> {
 
     pub fn alloc(&mut self) -> Option<BlockId> {
         let id = self.free_list.pop()?;
-        self.ref_counts[id.0].store(1, Ordering::Relaxed);
-        self.committed[id.0].store(false, Ordering::Relaxed);
+        // Release ordering ensures the ref-count initialization is visible to any
+        // thread that later acquires this BlockId. Makes the eventual M3 threading
+        // transition safe without a latent data race.
+        self.ref_counts[id.0].store(1, Ordering::Release);
+        // committed is already false — decref resets it before returning the slot
+        // to the free list, so a redundant store here is unnecessary.
         Some(id)
     }
 
@@ -75,7 +82,20 @@ impl<const B: usize> BlockSlab<B> {
         self.ref_counts[id.0].fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Decrement the reference count for `id`. When the count reaches zero,
+    /// the slot is reset and returned to the free list.
+    ///
+    /// Takes `&mut self` because returning a slot to the free list requires
+    /// exclusive access to the `Vec`. At M1 (single-threaded), this is the
+    /// correct contract: only the exclusive slab owner may release a block.
+    /// M3 will revisit this with an interior-mutable free list for multi-writer
+    /// support.
     pub fn decref(&mut self, id: BlockId) {
+        debug_assert!(
+            self.ref_counts[id.0].load(Ordering::Relaxed) > 0,
+            "decref on block {} with zero ref count — double-free",
+            id.0
+        );
         let prev = self.ref_counts[id.0].fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
             self.committed[id.0].store(false, Ordering::Relaxed);
