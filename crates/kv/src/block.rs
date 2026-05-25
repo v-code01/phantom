@@ -14,7 +14,6 @@ enum BlockSlabBacking {
 }
 
 pub struct BlockSlab<const B: usize> {
-    #[allow(dead_code)] // used in Task 3 commit_block / block_ptr
     data_ptr: *mut u8,
     _backing: BlockSlabBacking,
     pub element_stride: usize,
@@ -115,13 +114,17 @@ impl<const B: usize> BlockSlab<B> {
     /// that loads `committed == true` is guaranteed to see all written bytes.
     ///
     /// # Safety
-    /// `src` must be valid for reads of `B * element_stride` bytes.
+    /// - `src` must be valid for reads of `B * element_stride` bytes.
+    /// - `id` must be an allocated block (ref count > 0). Calling this on a freed
+    ///   slot is a logical error and produces stale data visible to future allocs.
     pub unsafe fn commit_block(&self, id: BlockId, src: *const u8) {
         debug_assert!(id.0 < self.capacity, "BlockId {} out of range (capacity {})", id.0, self.capacity);
         let dst = self.data_ptr.add(id.0 * B * self.element_stride);
         std::ptr::copy_nonoverlapping(src, dst, B * self.element_stride);
-        // SeqCst store: ensures all preceding writes to the block data are
-        // visible to any reader that subsequently observes committed == true.
+        // SeqCst store pairs with the SeqCst load in block_ptr. A Release/Acquire
+        // pair would be sufficient for I5 correctness; SeqCst is used as a
+        // conservative default. M3 can relax to Release/Acquire once the
+        // multi-threaded protocol is fully specified.
         self.committed[id.0].store(true, Ordering::SeqCst);
     }
 
@@ -132,9 +135,9 @@ impl<const B: usize> BlockSlab<B> {
     /// reader sees a partially-written block.
     pub fn block_ptr(&self, id: BlockId) -> Result<*const u8, BlockError> {
         debug_assert!(id.0 < self.capacity, "BlockId {} out of range (capacity {})", id.0, self.capacity);
-        // SeqCst load pairs with the SeqCst store in commit_block, establishing
-        // a happens-before edge: all writes visible before the store are
-        // guaranteed visible after this load returns true.
+        // SeqCst load pairs with the SeqCst store in commit_block. Release/Acquire
+        // is the minimal sufficient ordering for I5; SeqCst is used as a conservative
+        // default pending the M3 threading specification.
         if !self.committed[id.0].load(Ordering::SeqCst) {
             return Err(BlockError::NotCommitted);
         }
