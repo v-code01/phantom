@@ -122,6 +122,56 @@ impl<const B: usize> CoherenceEngine<B> {
         Ok(())
     }
 
+    /// E/S → S. Add `agent` to the sharer set; return backing block ids.
+    /// Updates seen[agent] = ver. Returns Err(WrongState) if state is M or I.
+    /// Returns Err(KBoundExceeded) if the agent's last-seen version is more than
+    /// k_bound writes behind the current version.
+    pub fn read(
+        &mut self,
+        id: ArtifactId,
+        agent: AgentId,
+    ) -> Result<Vec<kv::BlockId>, CoherenceError> {
+        let k_bound = self.k_bound;
+        let entry = self.artifacts.get_mut(&id).ok_or(CoherenceError::NotFound)?;
+        match entry.state {
+            crate::MesiState::Modified | crate::MesiState::Invalid => {
+                return Err(CoherenceError::WrongState);
+            }
+            _ => {}
+        }
+        // K-bound check: reject if the agent has read before and their seen is too stale.
+        // Fresh readers (not in seen map) are always allowed.
+        if let Some(&s) = entry.seen.get(&agent) {
+            if entry.ver.saturating_sub(s) > k_bound {
+                return Err(CoherenceError::KBoundExceeded);
+            }
+        }
+        entry.state = crate::MesiState::Shared;
+        entry.owner = None;
+        entry.sharers.insert(agent);
+        entry.seen.insert(agent, entry.ver);
+        debug_assert!(entry.invariants_hold(k_bound));
+        Ok(entry.blocks.clone())
+    }
+
+    /// E → M stub. Full implementation in Task 6.
+    pub fn write(
+        &mut self,
+        id: ArtifactId,
+        agent: AgentId,
+        tokens: &[kv::TokenId],
+        kv_data: &[&[u8]],
+    ) -> Result<(), CoherenceError> {
+        let _ = (id, agent, tokens, kv_data);
+        unimplemented!("write: implemented in Task 6")
+    }
+
+    /// M → E stub. Full implementation in Task 7.
+    pub fn writeback(&mut self, id: ArtifactId) -> Result<(), CoherenceError> {
+        let _ = id;
+        unimplemented!("writeback: implemented in Task 7")
+    }
+
     /// Run all four TLA+ invariants across every registered artifact.
     /// Returns Ok(()) if all pass; Err(id) for the first failing artifact.
     pub fn check_invariants(&self) -> Result<(), ArtifactId> {
@@ -203,5 +253,95 @@ mod tests {
         // Already Exclusive — acquire must fail
         let err = e.acquire(id, 1);
         assert!(matches!(err, Err(crate::CoherenceError::WrongState)));
+    }
+
+    #[test]
+    fn read_from_exclusive_demotes_to_shared() {
+        let mut e = CoherenceEngine::<2>::new_heap(8, 4, 5);
+        let tokens: Vec<kv::TokenId> = vec![0, 1, 2, 3];
+        let data = make_kv_data(2);
+        let slices: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+        let id = e.register(&tokens, &slices, 0).unwrap();
+        let blocks = e.read(id, 1).expect("read from Exclusive must succeed");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(e.artifacts[&id].state, crate::MesiState::Shared);
+        assert_eq!(e.artifacts[&id].owner, None);
+        assert!(e.artifacts[&id].sharers.contains(&1));
+        assert_eq!(e.artifacts[&id].seen[&1], 0); // ver=0 at time of read
+        assert!(e.check_invariants().is_ok());
+    }
+
+    #[test]
+    fn read_from_shared_adds_second_sharer() {
+        let mut e = CoherenceEngine::<2>::new_heap(8, 4, 5);
+        let tokens: Vec<kv::TokenId> = vec![0, 1, 2, 3];
+        let data = make_kv_data(2);
+        let slices: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+        let id = e.register(&tokens, &slices, 0).unwrap();
+        e.read(id, 1).unwrap();
+        e.read(id, 2).unwrap();
+        assert!(e.artifacts[&id].sharers.contains(&1));
+        assert!(e.artifacts[&id].sharers.contains(&2));
+        assert!(e.check_invariants().is_ok());
+    }
+
+    #[test]
+    fn read_from_modified_returns_wrong_state() {
+        let mut e = CoherenceEngine::<2>::new_heap(8, 4, 5);
+        let tokens: Vec<kv::TokenId> = vec![0, 1, 2, 3];
+        let data = make_kv_data(2);
+        let slices: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+        let id = e.register(&tokens, &slices, 0).unwrap();
+        // Force M state
+        e.artifacts.get_mut(&id).unwrap().state = crate::MesiState::Modified;
+        let err = e.read(id, 1);
+        assert!(matches!(err, Err(crate::CoherenceError::WrongState)));
+    }
+
+    #[test]
+    fn read_from_invalid_returns_wrong_state() {
+        let mut e = CoherenceEngine::<2>::new_heap(8, 4, 5);
+        let tokens: Vec<kv::TokenId> = vec![0, 1, 2, 3];
+        let data = make_kv_data(2);
+        let slices: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+        let id = e.register(&tokens, &slices, 0).unwrap();
+        e.invalidate(id).unwrap();
+        let err = e.read(id, 1);
+        assert!(matches!(err, Err(crate::CoherenceError::WrongState)));
+    }
+
+    #[test]
+    fn read_stale_beyond_k_returns_error() {
+        // k_bound=0: any unseen write makes a previously-reading agent stale.
+        //
+        // Sequence that triggers K-bound exceeded without concurrent writes:
+        //   1. Register (ver=0, E, owner=0)
+        //   2. Agent 1 reads → S, seen[1]=0
+        //   3. Invalidate → I, seen[1]=0 preserved
+        //   4. Agent 0 acquire → E
+        //   5. Agent 0 writes → ver=1, M
+        //   6. Writeback → E
+        //   7. Agent 1 reads → seen[1]=0, ver=1, 1-0=1 > k_bound=0 → KBoundExceeded
+        let mut e = CoherenceEngine::<2>::new_heap(8, 4, 0); // k_bound=0
+        let tokens: Vec<kv::TokenId> = vec![0, 1, 2, 3];
+        let data = make_kv_data(2);
+        let slices: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+        let id = e.register(&tokens, &slices, 0).unwrap();
+        e.read(id, 1).unwrap();           // step 2: agent 1 joins S, seen[1]=0
+        e.invalidate(id).unwrap();        // step 3
+        e.acquire(id, 0).unwrap();        // step 4
+
+        // step 5: write needs E state and extends tokens
+        let tokens_ext: Vec<kv::TokenId> = vec![0, 1, 2, 3, 4, 5];
+        let data_ext = make_kv_data(3);
+        let slices_ext: Vec<&[u8]> = data_ext.iter().map(|v| v.as_slice()).collect();
+        e.write(id, 0, &tokens_ext, &slices_ext).unwrap();
+        e.writeback(id).unwrap();         // step 6: M → E
+
+        let err = e.read(id, 1);          // step 7: agent 1 is stale
+        assert!(
+            matches!(err, Err(crate::CoherenceError::KBoundExceeded)),
+            "agent with seen=0 must not read past k_bound=0 when ver=1"
+        );
     }
 }
