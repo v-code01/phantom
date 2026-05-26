@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-acs          = { path = "../acs" }
 kv           = { path = "../kv" }
 metal        = { workspace = true }
 xxhash-rust  = { version = "0.8", features = ["xxh3"] }

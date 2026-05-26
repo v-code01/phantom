@@ -1,5 +1,5 @@
-pub mod engine;
-pub mod entry;
+pub(crate) mod engine;
+pub(crate) mod entry;
 
 pub use engine::CoherenceEngine;
 

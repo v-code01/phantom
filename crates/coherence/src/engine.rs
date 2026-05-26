@@ -95,6 +95,12 @@ impl<const B: usize> CoherenceEngine<B> {
     ///
     /// Clears owner, sharers, and blocks. Does NOT clear `seen`, matching the
     /// TLA+ UNCHANGED <<seen>> invariant in the Invalidate action.
+    ///
+    /// # M1 limitation
+    /// `kv.evict(n)` sweeps the global LRU rather than freeing this artifact's
+    /// blocks specifically. Under fork-heavy workloads, the freed blocks may not
+    /// correspond to the artifact being invalidated. Accurate per-artifact block
+    /// release requires `KvCache::release`, deferred to M3.
     pub fn invalidate(&mut self, id: ArtifactId) -> Result<(), CoherenceError> {
         let k_bound = self.k_bound;
         // Scope the mutable borrow of `entry` so it ends before the call to
@@ -239,11 +245,6 @@ impl<const B: usize> CoherenceEngine<B> {
     /// Run all four TLA+ invariants across every registered artifact.
     /// Returns Ok(()) if all pass; Err(id) for the first failing artifact.
     pub fn check_invariants(&self) -> Result<(), ArtifactId> {
-        // Validate that kv and artifacts are in sync: every artifact's blocks
-        // should correspond to allocated regions in kv. For now, this is a no-op,
-        // but the check ensures kv is part of the invariant verification pipeline.
-        let _ = &self.kv;
-
         for (&id, entry) in &self.artifacts {
             if !entry.invariants_hold(self.k_bound) {
                 return Err(id);

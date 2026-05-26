@@ -2,7 +2,6 @@ use std::collections::{HashMap, HashSet};
 use kv::BlockId;
 use crate::{AgentId, MesiState};
 
-#[allow(dead_code)]
 pub(crate) struct ArtifactEntry {
     pub state:   MesiState,
     pub ver:     u64,
@@ -14,7 +13,6 @@ pub(crate) struct ArtifactEntry {
     pub blocks:  Vec<BlockId>,
 }
 
-#[allow(dead_code)]
 impl ArtifactEntry {
     pub(crate) fn new_exclusive(owner: AgentId, blocks: Vec<BlockId>) -> Self {
         Self {
