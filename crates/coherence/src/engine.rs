@@ -188,10 +188,18 @@ impl<const B: usize> CoherenceEngine<B> {
         Ok(())
     }
 
-    /// M → E stub. Full implementation in Task 7.
+    /// M → E. Stabilise a modified artifact without evicting it.
+    /// Retains the current owner in Exclusive state for continued use.
+    /// Returns Err(WrongState) if state is not Modified.
     pub fn writeback(&mut self, id: ArtifactId) -> Result<(), CoherenceError> {
-        let _ = id;
-        unimplemented!("writeback: implemented in Task 7")
+        let k_bound = self.k_bound;
+        let entry = self.artifacts.get_mut(&id).ok_or(CoherenceError::NotFound)?;
+        if entry.state != crate::MesiState::Modified {
+            return Err(CoherenceError::WrongState);
+        }
+        entry.state = crate::MesiState::Exclusive;
+        debug_assert!(entry.invariants_hold(k_bound));
+        Ok(())
     }
 
     /// Run all four TLA+ invariants across every registered artifact.
@@ -416,5 +424,94 @@ mod tests {
             matches!(err, Err(crate::CoherenceError::KBoundExceeded)),
             "agent with seen=0 must not read past k_bound=0 when ver=1"
         );
+    }
+
+    #[test]
+    fn writeback_modified_to_exclusive() {
+        let mut e = CoherenceEngine::<2>::new_heap(16, 4, 5);
+        let tokens: Vec<kv::TokenId> = vec![0, 1, 2, 3];
+        let data = make_kv_data(2);
+        let slices: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+        let id = e.register(&tokens, &slices, 0).unwrap();
+
+        let tokens_ext: Vec<kv::TokenId> = vec![0, 1, 2, 3, 4, 5];
+        let data_ext = make_kv_data(3);
+        let slices_ext: Vec<&[u8]> = data_ext.iter().map(|v| v.as_slice()).collect();
+        e.write(id, 0, &tokens_ext, &slices_ext).unwrap();
+        assert_eq!(e.artifacts[&id].state, crate::MesiState::Modified);
+
+        e.writeback(id).expect("writeback must succeed from Modified");
+        assert_eq!(e.artifacts[&id].state, crate::MesiState::Exclusive);
+        assert_eq!(e.artifacts[&id].owner, Some(0)); // owner retained
+        assert!(e.check_invariants().is_ok());
+    }
+
+    #[test]
+    fn writeback_from_exclusive_returns_wrong_state() {
+        let mut e = CoherenceEngine::<2>::new_heap(8, 4, 5);
+        let tokens: Vec<kv::TokenId> = vec![0, 1, 2, 3];
+        let data = make_kv_data(2);
+        let slices: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+        let id = e.register(&tokens, &slices, 0).unwrap();
+        let err = e.writeback(id); // already E, not M
+        assert!(matches!(err, Err(crate::CoherenceError::WrongState)));
+    }
+
+    #[test]
+    fn invalidate_exclusive_transitions_to_invalid() {
+        let mut e = CoherenceEngine::<2>::new_heap(8, 4, 5);
+        let tokens: Vec<kv::TokenId> = vec![0, 1, 2, 3];
+        let data = make_kv_data(2);
+        let slices: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+        let id = e.register(&tokens, &slices, 0).unwrap();
+        e.invalidate(id).expect("invalidate from E must succeed");
+        assert_eq!(e.artifacts[&id].state, crate::MesiState::Invalid);
+        assert_eq!(e.artifacts[&id].owner, None);
+        assert!(e.artifacts[&id].blocks.is_empty());
+        assert!(e.check_invariants().is_ok());
+    }
+
+    #[test]
+    fn invalidate_shared_clears_all_sharers() {
+        let mut e = CoherenceEngine::<2>::new_heap(8, 4, 5);
+        let tokens: Vec<kv::TokenId> = vec![0, 1, 2, 3];
+        let data = make_kv_data(2);
+        let slices: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+        let id = e.register(&tokens, &slices, 0).unwrap();
+        e.read(id, 1).unwrap();
+        e.read(id, 2).unwrap();
+        assert_eq!(e.artifacts[&id].sharers.len(), 2);
+        e.invalidate(id).expect("invalidate from S must succeed");
+        assert!(e.artifacts[&id].sharers.is_empty());
+        assert!(e.check_invariants().is_ok());
+    }
+
+    #[test]
+    fn invalidate_modified_returns_wrong_state() {
+        let mut e = CoherenceEngine::<2>::new_heap(16, 4, 5);
+        let tokens: Vec<kv::TokenId> = vec![0, 1, 2, 3];
+        let data = make_kv_data(2);
+        let slices: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+        let id = e.register(&tokens, &slices, 0).unwrap();
+        let tokens_ext: Vec<kv::TokenId> = vec![0, 1, 2, 3, 4, 5];
+        let data_ext = make_kv_data(3);
+        let slices_ext: Vec<&[u8]> = data_ext.iter().map(|v| v.as_slice()).collect();
+        e.write(id, 0, &tokens_ext, &slices_ext).unwrap();
+        let err = e.invalidate(id); // must writeback first
+        assert!(matches!(err, Err(crate::CoherenceError::WrongState)));
+    }
+
+    #[test]
+    fn seen_preserved_across_invalidate() {
+        // TLA+ UNCHANGED <<seen>> in Invalidate: seen values survive invalidation.
+        let mut e = CoherenceEngine::<2>::new_heap(8, 4, 0); // k_bound=0
+        let tokens: Vec<kv::TokenId> = vec![0, 1, 2, 3];
+        let data = make_kv_data(2);
+        let slices: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+        let id = e.register(&tokens, &slices, 0).unwrap();
+        e.read(id, 1).unwrap();           // seen[1] = 0
+        e.invalidate(id).unwrap();
+        assert_eq!(e.artifacts[&id].seen.get(&1), Some(&0),
+            "seen must not be cleared by invalidate");
     }
 }
