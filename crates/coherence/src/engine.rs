@@ -202,6 +202,40 @@ impl<const B: usize> CoherenceEngine<B> {
         Ok(())
     }
 
+    /// Create a new artifact by CoW-forking an existing one.
+    /// `source` must be in Exclusive or Shared state.
+    /// The new artifact starts in Exclusive state owned by `agent`.
+    /// Calls `kv.fork(tokens)` for zero-copy prefix sharing.
+    ///
+    /// Returns Err(NotFound) if source is not registered.
+    /// Returns Err(WrongState) if source is M or I.
+    /// Returns Err(AlreadyExists) if tokens hash to an already-registered ArtifactId.
+    pub fn register_fork(
+        &mut self,
+        tokens: &[kv::TokenId],
+        source: ArtifactId,
+        agent: AgentId,
+    ) -> Result<ArtifactId, CoherenceError> {
+        // Validate source state (immutable borrow dropped before kv access).
+        {
+            let src = self.artifacts.get(&source).ok_or(CoherenceError::NotFound)?;
+            match src.state {
+                crate::MesiState::Exclusive | crate::MesiState::Shared => {}
+                _ => return Err(CoherenceError::WrongState),
+            }
+        }
+        let new_id = ArtifactId::from_tokens(tokens);
+        if self.artifacts.contains_key(&new_id) {
+            return Err(CoherenceError::AlreadyExists);
+        }
+        // kv.fork does a longest-prefix match on tokens — zero memcpy for shared prefix.
+        let blocks = self.kv.fork(tokens);
+        let entry = ArtifactEntry::new_exclusive(agent, blocks);
+        debug_assert!(entry.invariants_hold(self.k_bound));
+        self.artifacts.insert(new_id, entry);
+        Ok(new_id)
+    }
+
     /// Run all four TLA+ invariants across every registered artifact.
     /// Returns Ok(()) if all pass; Err(id) for the first failing artifact.
     pub fn check_invariants(&self) -> Result<(), ArtifactId> {
@@ -513,5 +547,77 @@ mod tests {
         e.invalidate(id).unwrap();
         assert_eq!(e.artifacts[&id].seen.get(&1), Some(&0),
             "seen must not be cleared by invalidate");
+    }
+
+    #[test]
+    fn register_fork_creates_exclusive_artifact_with_shared_prefix() {
+        let mut e = CoherenceEngine::<2>::new_heap(16, 4, 5);
+        let tokens: Vec<kv::TokenId> = vec![0, 1, 2, 3];
+        let data = make_kv_data(2);
+        let slices: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+        let base_id = e.register(&tokens, &slices, 0).unwrap();
+
+        // Fork: agent 1 starts a divergent sequence from the shared prefix
+        let fork_tokens: Vec<kv::TokenId> = vec![0, 1, 2, 3, 4, 5];
+        let fork_id = e.register_fork(&fork_tokens, base_id, 1)
+            .expect("register_fork must succeed");
+
+        assert_ne!(fork_id, base_id, "fork must get a new ArtifactId");
+        assert_eq!(e.artifacts[&fork_id].state, crate::MesiState::Exclusive);
+        assert_eq!(e.artifacts[&fork_id].owner, Some(1));
+        // Fork prefix blocks are shared with base (CoW)
+        assert_eq!(
+            e.artifacts[&fork_id].blocks[..2],
+            e.artifacts[&base_id].blocks[..2],
+            "first 2 blocks must be shared with the base artifact"
+        );
+        assert!(e.check_invariants().is_ok());
+    }
+
+    #[test]
+    fn register_fork_from_invalid_returns_wrong_state() {
+        let mut e = CoherenceEngine::<2>::new_heap(8, 4, 5);
+        let tokens: Vec<kv::TokenId> = vec![0, 1, 2, 3];
+        let data = make_kv_data(2);
+        let slices: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+        let base_id = e.register(&tokens, &slices, 0).unwrap();
+        e.invalidate(base_id).unwrap();
+
+        let fork_tokens: Vec<kv::TokenId> = vec![0, 1, 2, 3, 4, 5];
+        let err = e.register_fork(&fork_tokens, base_id, 1);
+        assert!(matches!(err, Err(crate::CoherenceError::WrongState)));
+    }
+
+    #[test]
+    fn register_fork_from_modified_returns_wrong_state() {
+        let mut e = CoherenceEngine::<2>::new_heap(16, 4, 5);
+        let tokens: Vec<kv::TokenId> = vec![0, 1, 2, 3];
+        let data = make_kv_data(2);
+        let slices: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+        let base_id = e.register(&tokens, &slices, 0).unwrap();
+        let tokens_ext: Vec<kv::TokenId> = vec![0, 1, 2, 3, 4, 5];
+        let data_ext = make_kv_data(3);
+        let slices_ext: Vec<&[u8]> = data_ext.iter().map(|v| v.as_slice()).collect();
+        e.write(base_id, 0, &tokens_ext, &slices_ext).unwrap();
+        // base is now Modified
+
+        let fork_tokens: Vec<kv::TokenId> = vec![0, 1, 2, 3, 6, 7];
+        let err = e.register_fork(&fork_tokens, base_id, 1);
+        assert!(matches!(err, Err(crate::CoherenceError::WrongState)));
+    }
+
+    #[test]
+    fn register_fork_duplicate_token_hash_returns_already_exists() {
+        let mut e = CoherenceEngine::<2>::new_heap(16, 4, 5);
+        let tokens: Vec<kv::TokenId> = vec![0, 1, 2, 3];
+        let data = make_kv_data(2);
+        let slices: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+        let base_id = e.register(&tokens, &slices, 0).unwrap();
+
+        let fork_tokens: Vec<kv::TokenId> = vec![0, 1, 2, 3, 4, 5];
+        e.register_fork(&fork_tokens, base_id, 1).unwrap();
+        // Same tokens → same ArtifactId → AlreadyExists
+        let err = e.register_fork(&fork_tokens, base_id, 2);
+        assert!(matches!(err, Err(crate::CoherenceError::AlreadyExists)));
     }
 }
