@@ -154,7 +154,10 @@ impl<const B: usize> CoherenceEngine<B> {
         Ok(entry.blocks.clone())
     }
 
-    /// E → M stub. Full implementation in Task 6.
+    /// E → M. The exclusive owner writes new KV data extending `tokens`,
+    /// increments the artifact version, and updates their seen version.
+    /// Returns Err(WrongState) if not Exclusive. Returns Err(NotOwner) if
+    /// `agent` is not the current exclusive owner.
     pub fn write(
         &mut self,
         id: ArtifactId,
@@ -162,8 +165,27 @@ impl<const B: usize> CoherenceEngine<B> {
         tokens: &[kv::TokenId],
         kv_data: &[&[u8]],
     ) -> Result<(), CoherenceError> {
-        let _ = (id, agent, tokens, kv_data);
-        unimplemented!("write: implemented in Task 6")
+        // Validate before touching KV. Immutable borrow dropped at end of block.
+        {
+            let entry = self.artifacts.get(&id).ok_or(CoherenceError::NotFound)?;
+            if entry.state != crate::MesiState::Exclusive {
+                return Err(CoherenceError::WrongState);
+            }
+            if entry.owner != Some(agent) {
+                return Err(CoherenceError::NotOwner);
+            }
+        }
+        self.kv.insert(tokens, kv_data).map_err(CoherenceError::KvError)?;
+        let new_blocks = self.kv.lookup(tokens).block_ids;
+        let k_bound = self.k_bound;
+        let entry = self.artifacts.get_mut(&id).unwrap();
+        entry.state = crate::MesiState::Modified;
+        entry.ver += 1;
+        // Owner sees its own write: matches TLA+ seen'[ag][a] = ver[a] + 1
+        entry.seen.insert(agent, entry.ver);
+        entry.blocks = new_blocks;
+        debug_assert!(entry.invariants_hold(k_bound));
+        Ok(())
     }
 
     /// M → E stub. Full implementation in Task 7.
@@ -307,6 +329,57 @@ mod tests {
         let id = e.register(&tokens, &slices, 0).unwrap();
         e.invalidate(id).unwrap();
         let err = e.read(id, 1);
+        assert!(matches!(err, Err(crate::CoherenceError::WrongState)));
+    }
+
+    #[test]
+    fn write_from_exclusive_transitions_to_modified() {
+        let mut e = CoherenceEngine::<2>::new_heap(16, 4, 5);
+        let tokens: Vec<kv::TokenId> = vec![0, 1, 2, 3];
+        let data = make_kv_data(2);
+        let slices: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+        let id = e.register(&tokens, &slices, 0).unwrap();
+
+        let tokens_ext: Vec<kv::TokenId> = vec![0, 1, 2, 3, 4, 5];
+        let data_ext = make_kv_data(3);
+        let slices_ext: Vec<&[u8]> = data_ext.iter().map(|v| v.as_slice()).collect();
+        e.write(id, 0, &tokens_ext, &slices_ext).expect("write from Exclusive must succeed");
+
+        assert_eq!(e.artifacts[&id].state, crate::MesiState::Modified);
+        assert_eq!(e.artifacts[&id].ver, 1);
+        assert_eq!(e.artifacts[&id].seen[&0], 1); // owner sees own write
+        assert_eq!(e.artifacts[&id].blocks.len(), 3);
+        assert!(e.check_invariants().is_ok());
+    }
+
+    #[test]
+    fn write_wrong_owner_returns_not_owner() {
+        let mut e = CoherenceEngine::<2>::new_heap(8, 4, 5);
+        let tokens: Vec<kv::TokenId> = vec![0, 1, 2, 3];
+        let data = make_kv_data(2);
+        let slices: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+        let id = e.register(&tokens, &slices, 0).unwrap(); // owner=0
+
+        let tokens_ext: Vec<kv::TokenId> = vec![0, 1, 2, 3, 4, 5];
+        let data_ext = make_kv_data(3);
+        let slices_ext: Vec<&[u8]> = data_ext.iter().map(|v| v.as_slice()).collect();
+        let err = e.write(id, 1, &tokens_ext, &slices_ext); // agent 1 ≠ owner
+        assert!(matches!(err, Err(crate::CoherenceError::NotOwner)));
+    }
+
+    #[test]
+    fn write_from_shared_returns_wrong_state() {
+        let mut e = CoherenceEngine::<2>::new_heap(8, 4, 5);
+        let tokens: Vec<kv::TokenId> = vec![0, 1, 2, 3];
+        let data = make_kv_data(2);
+        let slices: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+        let id = e.register(&tokens, &slices, 0).unwrap();
+        e.read(id, 1).unwrap(); // demotes to Shared
+
+        let tokens_ext: Vec<kv::TokenId> = vec![0, 1, 2, 3, 4, 5];
+        let data_ext = make_kv_data(3);
+        let slices_ext: Vec<&[u8]> = data_ext.iter().map(|v| v.as_slice()).collect();
+        let err = e.write(id, 0, &tokens_ext, &slices_ext);
         assert!(matches!(err, Err(crate::CoherenceError::WrongState)));
     }
 
