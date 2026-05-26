@@ -202,7 +202,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires Apple Silicon hardware with Metal support"]
     fn mtlbuffer_shared_ptr_nonzero() {
         let device = metal::Device::system_default()
             .expect("no Metal device: run on Apple Silicon");
@@ -220,7 +219,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires Apple Silicon hardware with Metal support"]
     fn cpu_write_gpu_visible() {
         // Verify that bytes written through the shared pointer are in the buffer
         // that Metal would read. We can't submit a GPU command here without a

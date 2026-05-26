@@ -65,7 +65,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "requires Apple Silicon hardware"]
     fn gpu_doubles_cpu_written_value_without_copy() {
         let result = double_on_gpu(21);
         assert_eq!(result, 42,
@@ -73,14 +72,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires Apple Silicon hardware"]
     fn gpu_handles_zero() {
         let result = double_on_gpu(0);
         assert_eq!(result, 0);
     }
 
     #[test]
-    #[ignore = "requires Apple Silicon hardware"]
     fn gpu_handles_large_value() {
         let result = double_on_gpu(1_000_000);
         assert_eq!(result, 2_000_000);

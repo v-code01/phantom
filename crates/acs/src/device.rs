@@ -38,7 +38,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "requires Apple Silicon hardware"]
     fn shared_buffer_cpu_write_read_roundtrip() {
         let device = system_device();
         let buf = shared_buffer(&device, 64);
@@ -56,7 +55,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires Apple Silicon hardware"]
     fn shared_buffer_is_shared_storage_mode() {
         let device = system_device();
         let buf = shared_buffer(&device, 64);
@@ -68,7 +66,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires Apple Silicon hardware"]
     fn try_system_device_returns_some_on_apple_silicon() {
         let dev = try_system_device();
         assert!(dev.is_some(), "try_system_device() must return Some on Apple Silicon");
@@ -79,14 +76,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires Apple Silicon hardware"]
     fn metal_device_exists() {
         let device = Device::system_default();
         assert!(device.is_some(), "no Metal device found — is this Apple Silicon?");
     }
 
     #[test]
-    #[ignore = "requires Apple Silicon hardware"]
     fn metal_device_has_unified_memory() {
         let device = Device::system_default().expect("no Metal device");
         assert!(
@@ -96,7 +91,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires Apple Silicon hardware"]
     fn system_device_returns_unified_memory_device() {
         let dev = system_device();
         assert!(dev.has_unified_memory());
