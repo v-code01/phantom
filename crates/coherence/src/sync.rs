@@ -75,6 +75,24 @@ impl<const B: usize> SyncEngine<B> {
         self.0.lock().unwrap().register(tokens, kv_data, agent)
     }
 
+    /// Create a new artifact by CoW-forking an existing one.
+    ///
+    /// `source` must be in `Exclusive` or `Shared` state. The new artifact
+    /// starts in `Exclusive` state owned by `agent`. Prefix blocks are shared
+    /// zero-copy via the underlying KV slab.
+    ///
+    /// Returns `Err(NotFound)` if `source` is not registered.
+    /// Returns `Err(WrongState)` if `source` is `Modified` or `Invalid`.
+    /// Returns `Err(AlreadyExists)` if `tokens` hash to an already-registered id.
+    pub fn register_fork(
+        &self,
+        tokens: &[TokenId],
+        source: ArtifactId,
+        agent: AgentId,
+    ) -> Result<ArtifactId, CoherenceError> {
+        self.0.lock().unwrap().register_fork(tokens, source, agent)
+    }
+
     /// I → E. Re-claim an invalidated artifact for exclusive write access.
     ///
     /// Returns `Err(NotFound)` if `id` is not registered.
@@ -180,6 +198,25 @@ mod tests {
         let b1 = t1.join().unwrap();
         let b2 = t2.join().unwrap();
         assert_eq!(b1, b2, "concurrent readers must see same blocks");
+        engine.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn sync_engine_register_fork_shares_prefix_blocks() {
+        let engine = SyncEngine::<2>::new_heap(16, 4, 5);
+        let base: Vec<TokenId> = vec![0, 1, 2, 3];
+        let data = make_data(2);
+        let slices: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+        let base_id = engine.register(&base, &slices, 0).unwrap();
+
+        // Fork extends the base with 2 more tokens
+        let ext: Vec<TokenId> = vec![0, 1, 2, 3, 4, 5];
+        let fork_id = engine.register_fork(&ext, base_id, 1).unwrap();
+
+        // Read both — prefix blocks must be identical
+        let base_blocks = engine.read(base_id, 0).unwrap();
+        let fork_blocks = engine.read(fork_id, 1).unwrap();
+        assert_eq!(base_blocks, fork_blocks, "fork must share prefix blocks with base");
         engine.check_invariants().unwrap();
     }
 }
