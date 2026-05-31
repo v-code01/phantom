@@ -45,9 +45,9 @@ pub enum CoherenceError {
 
 #[derive(Debug, Clone)]
 pub struct RouteResult {
-    pub artifact_id:    ArtifactId,
+    pub artifact_id: ArtifactId,
     pub matched_tokens: usize,
-    pub blocks:         Vec<BlockId>,
+    pub blocks: Vec<BlockId>,
 }
 
 #[cfg(test)]

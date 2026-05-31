@@ -117,11 +117,10 @@ impl<const B: usize> CoherenceEngine<B> {
             {
                 return Err(CoherenceError::WrongState);
             }
-            let blocks = entry.blocks.clone();
+            let blocks = std::mem::take(&mut entry.blocks);
             entry.state = crate::MesiState::Invalid;
             entry.owner = None;
             entry.sharers.clear();
-            entry.blocks.clear();
             blocks
         };
         // Targeted per-artifact release — not a global LRU sweep.
@@ -259,6 +258,11 @@ impl<const B: usize> CoherenceEngine<B> {
     ///
     /// Complexity: O(n * |tokens|) over registered artifacts. Sufficient for M3;
     /// a dedicated routing index is deferred to M4.
+    ///
+    /// Note: this method does not update the KV trie's LRU clock. Blocks surfaced
+    /// by this path will not have `last_used` refreshed; under heavy eviction
+    /// pressure they may be evicted sooner than expected. Addressed in M4.
+    #[must_use]
     pub fn lookup(&self, tokens: &[kv::TokenId]) -> Option<crate::RouteResult> {
         let mut best: Option<crate::RouteResult> = None;
         for (&id, entry) in &self.artifacts {
@@ -269,7 +273,10 @@ impl<const B: usize> CoherenceEngine<B> {
             if matched == 0 {
                 continue;
             }
-            let better = best.as_ref().map_or(true, |b| matched > b.matched_tokens);
+            let better = best.as_ref().map_or(true, |b| {
+                matched > b.matched_tokens
+                    || (matched == b.matched_tokens && id.0 < b.artifact_id.0)
+            });
             if better {
                 best = Some(crate::RouteResult {
                     artifact_id:    id,
@@ -710,6 +717,14 @@ mod tests {
         e.invalidate(id).unwrap();
         // After invalidate, state=Invalid — lookup must return None
         assert!(e.lookup(&tokens).is_none(), "Invalid artifact must not be returned by lookup");
+
+        // Also verify Modified artifacts are skipped
+        let tokens2: Vec<kv::TokenId> = vec![4, 5, 6, 7];
+        let d2 = make_kv_data(2);
+        let s2: Vec<&[u8]> = d2.iter().map(|v| v.as_slice()).collect();
+        let id2 = e.register(&tokens2, &s2, 1).unwrap();
+        e.artifacts.get_mut(&id2).unwrap().state = crate::MesiState::Modified;
+        assert!(e.lookup(&tokens2).is_none(), "Modified artifact must not be returned by lookup");
     }
 
     #[test]
