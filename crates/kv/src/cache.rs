@@ -88,16 +88,15 @@ impl<const B: usize> KvCache<B> {
     /// CoW fork: increment ref counts on shared prefix trie nodes and return their
     /// block ids. Zero memcpy — the caller receives the same `BlockId`s as the
     /// inserted sequence.
-    ///
-    /// # M1 limitation
-    /// This method increments the trie-internal `rc` field on matched nodes but
-    /// does NOT call `BlockSlab::incref`. The trie `rc` is the sole guard against
-    /// premature eviction at M1. Callers that hold a `Vec<BlockId>` from this
-    /// method must not free those blocks via any path that bypasses `KvCache::evict`.
-    /// M3 will add a symmetric `release` operation that decrements both trie `rc`
-    /// and slab ref counts.
     pub fn fork(&mut self, tokens: &[TokenId]) -> Vec<BlockId> {
-        self.trie.fork(tokens)
+        let ids = self.trie.fork(tokens);
+        // Fix M1 slab ref-count leak: trie.fork() incremented trie rc but never
+        // called slab.incref, leaving slab ref_count=1 for shared blocks. A decref
+        // on either artifact path would free a block the other still holds.
+        for &id in &ids {
+            self.slab.incref(id);
+        }
+        ids
     }
 
     /// Evict up to `target` LRU blocks.  Returns the actual freed count.
@@ -110,7 +109,74 @@ impl<const B: usize> KvCache<B> {
         n
     }
 
+    /// Release blocks belonging to a specific artifact. Decrements trie rc for
+    /// routing cleanup; calls slab.decref for every block unconditionally.
+    /// Contrast with evict() which sweeps global LRU regardless of ownership.
+    pub fn release(&mut self, blocks: &[BlockId]) {
+        self.trie.release(blocks);
+        for &id in blocks {
+            self.slab.decref(id);
+        }
+    }
+
     pub fn free_count(&self) -> usize {
         self.slab.free_count()
+    }
+}
+
+// SAFETY: BlockSlab<B>: Sync (above). DualRadixTrie fields are Vec and HashMap
+// which are Sync. All mutation goes through &mut self methods, serialized
+// externally by the Mutex in SyncEngine.
+unsafe impl<const B: usize> Sync for KvCache<B> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_kv_blocks(n: usize, stride: usize) -> Vec<Vec<u8>> {
+        (0..n).map(|i| vec![i as u8; stride]).collect()
+    }
+
+    #[test]
+    fn release_returns_slab_blocks_to_free_list() {
+        // B=2, element_stride=4: 2 blocks × (2*4)=8 bytes each, capacity=4
+        let mut kv = KvCache::<2>::new_heap(4, 4);
+        let tokens: Vec<u32> = vec![0, 1, 2, 3];
+        let data = make_kv_blocks(2, 8);
+        let slices: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+        kv.insert(&tokens, &slices).unwrap();
+        let blocks = kv.lookup(&tokens).block_ids;
+        assert_eq!(kv.free_count(), 2, "2 blocks used, 2 free");
+        kv.release(&blocks);
+        assert_eq!(kv.free_count(), 4, "release must return all 2 blocks to slab");
+    }
+
+    #[test]
+    fn fork_then_release_original_leaves_fork_accessible() {
+        // B=2, capacity=4
+        let mut kv = KvCache::<2>::new_heap(4, 4);
+        let tokens: Vec<u32> = vec![0, 1, 2, 3];
+        let data = make_kv_blocks(2, 8);
+        let slices: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+        kv.insert(&tokens, &slices).unwrap();
+        let orig_blocks = kv.lookup(&tokens).block_ids;
+        let forked_blocks = kv.fork(&tokens); // incref — slab rc → 2
+        assert_eq!(orig_blocks, forked_blocks);
+
+        // Release original's blocks; slab rc → 1 — fork still holds them
+        kv.release(&orig_blocks);
+        // Slab should still have the blocks occupied (fork holds them)
+        // free_count is 2 (the 2 slots are still in use by the fork)
+        assert_eq!(kv.free_count(), 2, "fork still holds the blocks");
+
+        // Releasing the fork's blocks brings free_count back to 4
+        kv.release(&forked_blocks);
+        assert_eq!(kv.free_count(), 4, "after releasing fork, all slots free");
+    }
+
+    #[test]
+    fn kvcache_is_sync() {
+        fn assert_sync<T: Sync>() {}
+        assert_sync::<KvCache<4>>();
     }
 }

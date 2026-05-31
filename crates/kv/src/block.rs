@@ -27,6 +27,12 @@ pub struct BlockSlab<const B: usize> {
 // BlockSlab. Single-threaded use in M1; Sync impl deferred to M3.
 unsafe impl<const B: usize> Send for BlockSlab<B> {}
 
+// SAFETY: data_ptr is only written via alloc()/decref() which take &mut self and
+// are serialized by the Mutex on CoherenceEngine. commit_block() and block_ptr()
+// take &self and operate on non-overlapping slab offsets; the SeqCst store/load
+// pair on `committed` provides visibility for the I5 invariant across threads.
+unsafe impl<const B: usize> Sync for BlockSlab<B> {}
+
 impl<const B: usize> BlockSlab<B> {
     pub fn new(device: &metal::Device, capacity: usize, element_stride: usize) -> Self {
         let size_bytes = capacity
