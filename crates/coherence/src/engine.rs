@@ -90,7 +90,7 @@ impl<const B: usize> CoherenceEngine<B> {
         Ok(())
     }
 
-    /// E/S → I. Evict an artifact, releasing its KV blocks back to the slab.
+    /// E/S → I. Invalidate an artifact, releasing its KV blocks back to the slab.
     ///
     /// Returns Err(NotFound) if `id` is not registered.
     /// Returns Err(WrongState) if state is Modified (must writeback first) or
@@ -102,16 +102,13 @@ impl<const B: usize> CoherenceEngine<B> {
     /// sequence from the last valid state. Callers should not read `tokens`
     /// from an Invalid entry.
     ///
-    /// # M1 limitation
-    /// `kv.evict(n)` sweeps the global LRU rather than freeing this artifact's
-    /// blocks specifically. Under fork-heavy workloads, the freed blocks may not
-    /// correspond to the artifact being invalidated. Accurate per-artifact block
-    /// release requires `KvCache::release`, deferred to M3.
+    /// Uses `kv.release()` for targeted per-artifact block release rather than
+    /// the global LRU sweep used by the deprecated `kv.evict()` path.
     pub fn invalidate(&mut self, id: ArtifactId) -> Result<(), CoherenceError> {
         let k_bound = self.k_bound;
-        // Scope the mutable borrow of `entry` so it ends before the call to
-        // `self.kv.evict`, which also requires `&mut self`.
-        let blocks_len = {
+        // Capture blocks before clearing; the borrow of entry must end before
+        // calling self.kv.release (which also needs &mut self).
+        let blocks = {
             let entry = self.artifacts.get_mut(&id).ok_or(CoherenceError::NotFound)?;
             // Modified requires writeback before invalidation to prevent data loss.
             // Invalid is already terminal; second call is a caller bug.
@@ -120,16 +117,15 @@ impl<const B: usize> CoherenceEngine<B> {
             {
                 return Err(CoherenceError::WrongState);
             }
-            let n = entry.blocks.len();
+            let blocks = entry.blocks.clone();
             entry.state = crate::MesiState::Invalid;
             entry.owner = None;
             entry.sharers.clear();
             entry.blocks.clear();
-            n
+            blocks
         };
-        // evict() returns the actual freed count; we pass blocks_len as the
-        // target — the trie LRU will free up to that many blocks.
-        self.kv.evict(blocks_len);
+        // Targeted per-artifact release — not a global LRU sweep.
+        self.kv.release(&blocks);
         debug_assert!(self.artifacts[&id].invariants_hold(k_bound));
         Ok(())
     }
@@ -255,6 +251,42 @@ impl<const B: usize> CoherenceEngine<B> {
         debug_assert!(entry.invariants_hold(self.k_bound));
         self.artifacts.insert(new_id, entry);
         Ok(new_id)
+    }
+
+    /// Find the artifact in E or S state with the longest token prefix match
+    /// against `tokens`. Returns None if no readable artifact covers any prefix.
+    /// M and I artifacts are skipped.
+    ///
+    /// Complexity: O(n * |tokens|) over registered artifacts. Sufficient for M3;
+    /// a dedicated routing index is deferred to M4.
+    pub fn lookup(&self, tokens: &[kv::TokenId]) -> Option<crate::RouteResult> {
+        let mut best: Option<crate::RouteResult> = None;
+        for (&id, entry) in &self.artifacts {
+            if !matches!(entry.state, crate::MesiState::Exclusive | crate::MesiState::Shared) {
+                continue;
+            }
+            let matched = Self::common_prefix_tokens(&entry.tokens, tokens);
+            if matched == 0 {
+                continue;
+            }
+            let better = best.as_ref().map_or(true, |b| matched > b.matched_tokens);
+            if better {
+                best = Some(crate::RouteResult {
+                    artifact_id:    id,
+                    matched_tokens: matched,
+                    blocks:         entry.blocks[..matched / B].to_vec(),
+                });
+            }
+        }
+        best
+    }
+
+    /// Count the number of leading tokens common to `a` and `b`, rounded down
+    /// to the nearest complete block boundary (multiple of B).
+    fn common_prefix_tokens(a: &[kv::TokenId], b: &[kv::TokenId]) -> usize {
+        let matched_tokens = a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count();
+        // Round down to complete block boundary. B is the impl block's const param.
+        (matched_tokens / B) * B
     }
 
     /// Run all four TLA+ invariants across every registered artifact.
@@ -644,5 +676,75 @@ mod tests {
         // Same tokens → same ArtifactId → AlreadyExists
         let err = e.register_fork(&fork_tokens, base_id, 2);
         assert!(matches!(err, Err(crate::CoherenceError::AlreadyExists)));
+    }
+
+    #[test]
+    fn lookup_returns_best_prefix_match() {
+        let mut e = CoherenceEngine::<2>::new_heap(16, 4, 5);
+        // short: 2 tokens = 1 block
+        let short: Vec<kv::TokenId> = vec![0, 1];
+        let d_short = make_kv_data(1);
+        let s_short: Vec<&[u8]> = d_short.iter().map(|v| v.as_slice()).collect();
+        e.register(&short, &s_short, 0).unwrap();
+
+        // long: 4 tokens = 2 blocks
+        let long: Vec<kv::TokenId> = vec![0, 1, 2, 3];
+        let d_long = make_kv_data(2);
+        let s_long: Vec<&[u8]> = d_long.iter().map(|v| v.as_slice()).collect();
+        e.register(&long, &s_long, 0).unwrap();
+
+        // query matches long more — lookup must return the longer artifact
+        let query: Vec<kv::TokenId> = vec![0, 1, 2, 3, 4, 5];
+        let result = e.lookup(&query).expect("lookup must find a match");
+        assert_eq!(result.matched_tokens, 4, "longer match must win");
+        assert_eq!(result.blocks.len(), 2);
+    }
+
+    #[test]
+    fn lookup_skips_modified_and_invalid() {
+        let mut e = CoherenceEngine::<2>::new_heap(16, 4, 5);
+        let tokens: Vec<kv::TokenId> = vec![0, 1, 2, 3];
+        let data = make_kv_data(2);
+        let slices: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+        let id = e.register(&tokens, &slices, 0).unwrap();
+        e.invalidate(id).unwrap();
+        // After invalidate, state=Invalid — lookup must return None
+        assert!(e.lookup(&tokens).is_none(), "Invalid artifact must not be returned by lookup");
+    }
+
+    #[test]
+    fn lookup_returns_none_on_empty_engine() {
+        let e = CoherenceEngine::<2>::new_heap(8, 4, 5);
+        assert!(e.lookup(&[0u32, 1]).is_none());
+    }
+
+    #[test]
+    fn lookup_rounds_down_to_block_boundary() {
+        // B=2: 3 matching tokens but only 1 complete block (2 tokens)
+        let mut e = CoherenceEngine::<2>::new_heap(8, 4, 5);
+        let tokens: Vec<kv::TokenId> = vec![0, 1];
+        let data = make_kv_data(1);
+        let slices: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+        e.register(&tokens, &slices, 0).unwrap();
+        // Query: [0, 1, 99] — only first 2 tokens (1 block) are cached
+        let result = e.lookup(&[0u32, 1, 99]).expect("1-block match must be found");
+        assert_eq!(result.matched_tokens, 2);
+        assert_eq!(result.blocks.len(), 1);
+    }
+
+    #[test]
+    fn invalidate_releases_exact_blocks_not_global_lru() {
+        // Two separate artifacts; invalidating one must not free the other's blocks.
+        let mut e = CoherenceEngine::<2>::new_heap(8, 4, 5);
+        let t1: Vec<kv::TokenId> = vec![0, 1, 2, 3];
+        let t2: Vec<kv::TokenId> = vec![4, 5, 6, 7];
+        let d = make_kv_data(2);
+        let s: Vec<&[u8]> = d.iter().map(|v| v.as_slice()).collect();
+        let id1 = e.register(&t1, &s, 0).unwrap();
+        e.register(&t2, &s, 1).unwrap();
+        // Slab: 4 blocks used, 4 free
+        e.invalidate(id1).unwrap();
+        // After invalidating id1 (2 blocks), slab should have exactly 2 more free.
+        assert_eq!(e.kv.free_count(), 6, "invalidate must free exactly the artifact's 2 blocks");
     }
 }

@@ -4,7 +4,7 @@ pub(crate) mod entry;
 pub use engine::CoherenceEngine;
 
 use xxhash_rust::xxh3::xxh3_64;
-use kv::TokenId;
+use kv::{BlockId, TokenId};
 
 pub type AgentId = usize;
 
@@ -41,6 +41,13 @@ pub enum CoherenceError {
     NotOwner,
     KBoundExceeded,
     KvError(kv::CacheError),
+}
+
+#[derive(Debug, Clone)]
+pub struct RouteResult {
+    pub artifact_id:    ArtifactId,
+    pub matched_tokens: usize,
+    pub blocks:         Vec<BlockId>,
 }
 
 #[cfg(test)]
