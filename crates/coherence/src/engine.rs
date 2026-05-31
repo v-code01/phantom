@@ -56,7 +56,7 @@ impl<const B: usize> CoherenceEngine<B> {
         // Retrieve the full block_id vec that was just inserted. The trie is
         // always consistent after insert(), so lookup() is infallible here.
         let blocks = self.kv.lookup(tokens).block_ids;
-        let entry = ArtifactEntry::new_exclusive(agent, blocks);
+        let entry = ArtifactEntry::new_exclusive(agent, blocks, tokens.to_vec());
         debug_assert!(entry.invariants_hold(self.k_bound));
         self.artifacts.insert(id, entry);
         Ok(id)
@@ -190,6 +190,7 @@ impl<const B: usize> CoherenceEngine<B> {
         // Owner sees its own write: matches TLA+ seen'[ag][a] = ver[a] + 1
         entry.seen.insert(agent, entry.ver);
         entry.blocks = new_blocks;
+        entry.tokens = tokens.to_vec();
         debug_assert!(entry.invariants_hold(k_bound));
         Ok(())
     }
@@ -236,7 +237,10 @@ impl<const B: usize> CoherenceEngine<B> {
         }
         // kv.fork does a longest-prefix match on tokens — zero memcpy for shared prefix.
         let blocks = self.kv.fork(tokens);
-        let entry = ArtifactEntry::new_exclusive(agent, blocks);
+        // tokens.to_vec() is the caller's intended sequence; blocks.len() * B is
+        // what's actually cached. Store only the cached portion in entry.tokens.
+        let cached_tokens = tokens[..blocks.len() * B].to_vec();
+        let entry = ArtifactEntry::new_exclusive(agent, blocks, cached_tokens);
         debug_assert!(entry.invariants_hold(self.k_bound));
         self.artifacts.insert(new_id, entry);
         Ok(new_id)

@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use kv::BlockId;
+use kv::{BlockId, TokenId};
 use crate::{AgentId, MesiState};
 
 pub(crate) struct ArtifactEntry {
@@ -11,17 +11,20 @@ pub(crate) struct ArtifactEntry {
     /// (matches TLA+ UNCHANGED <<seen>> in Invalidate action).
     pub seen:    HashMap<AgentId, u64>,
     pub blocks:  Vec<BlockId>,
+    /// Token sequence covered by `blocks`. Always satisfies tokens.len() == blocks.len() * B.
+    pub tokens:  Vec<TokenId>,
 }
 
 impl ArtifactEntry {
-    pub(crate) fn new_exclusive(owner: AgentId, blocks: Vec<BlockId>) -> Self {
+    pub(crate) fn new_exclusive(owner: AgentId, blocks: Vec<BlockId>, tokens: Vec<TokenId>) -> Self {
         Self {
-            state: MesiState::Exclusive,
-            ver: 0,
-            owner: Some(owner),
+            state:   MesiState::Exclusive,
+            ver:     0,
+            owner:   Some(owner),
             sharers: HashSet::new(),
-            seen: HashMap::new(),
+            seen:    HashMap::new(),
             blocks,
+            tokens,
         }
     }
 
@@ -54,7 +57,7 @@ mod tests {
     use super::*;
 
     fn entry_valid_exclusive(k: u64) -> bool {
-        let e = ArtifactEntry::new_exclusive(0, vec![kv::BlockId(0)]);
+        let e = ArtifactEntry::new_exclusive(0, vec![kv::BlockId(0)], vec![0, 1]);
         e.invariants_hold(k)
     }
 
@@ -64,8 +67,15 @@ mod tests {
     }
 
     #[test]
+    fn new_exclusive_has_tokens_field() {
+        let tokens: Vec<kv::TokenId> = vec![0, 1, 2, 3];
+        let e = ArtifactEntry::new_exclusive(0, vec![kv::BlockId(0), kv::BlockId(1)], tokens.clone());
+        assert_eq!(e.tokens, tokens);
+    }
+
+    #[test]
     fn modified_with_sharers_violates_swmr() {
-        let mut e = ArtifactEntry::new_exclusive(0, vec![]);
+        let mut e = ArtifactEntry::new_exclusive(0, vec![], vec![]);
         e.state = crate::MesiState::Modified;
         e.sharers.insert(1);
         assert!(!e.invariants_hold(5));
@@ -73,27 +83,26 @@ mod tests {
 
     #[test]
     fn seen_past_ver_violates_seen_bound() {
-        let mut e = ArtifactEntry::new_exclusive(0, vec![]);
-        e.seen.insert(1, 99); // ver=0, seen=99: invalid
+        let mut e = ArtifactEntry::new_exclusive(0, vec![], vec![]);
+        e.seen.insert(1, 99);
         assert!(!e.invariants_hold(5));
     }
 
     #[test]
     fn sharer_stale_beyond_k_violates_kbound() {
-        let mut e = ArtifactEntry::new_exclusive(0, vec![]);
+        let mut e = ArtifactEntry::new_exclusive(0, vec![], vec![]);
         e.state = crate::MesiState::Shared;
         e.owner = None;
         e.ver = 5;
         e.sharers.insert(1);
-        e.seen.insert(1, 3); // 5 - 3 = 2 > k_bound=1
+        e.seen.insert(1, 3);
         assert!(!e.invariants_hold(1));
     }
 
     #[test]
     fn shared_state_with_owner_violates_owner_consistency() {
-        let mut e = ArtifactEntry::new_exclusive(0, vec![]);
+        let mut e = ArtifactEntry::new_exclusive(0, vec![], vec![]);
         e.state = crate::MesiState::Shared;
-        // owner is still Some(0) — violates OwnerConsistency
         assert!(!e.invariants_hold(5));
     }
 }
