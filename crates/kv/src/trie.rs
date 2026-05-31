@@ -10,9 +10,8 @@ struct TrieNode {
     parent_idx: Option<usize>, // None if direct child of root
     parent_key: u64,           // key this node is stored under in parent
     rc: u32,   // active forks holding this block; incremented by fork().
-               // A node is eligible for eviction only when rc == 0 and it has no
-               // children. rc is never explicitly decremented; nodes are dropped
-               // from the arena entirely when evict_lru removes them.
+               // Decremented by release(). A node is eligible for eviction only
+               // when rc == 0 and it has no children.
     last_used: u64,            // monotonic clock for LRU
 }
 
@@ -298,7 +297,9 @@ impl<const B: usize> DualRadixTrie<B> {
 
     /// Decrement rc for each block in `blocks`. Remove a node from the arena
     /// when rc reaches zero and the node has no children. Nodes with children
-    /// are retained for routing even at rc=0.
+    /// are retained for routing even at rc=0. If `rc` is already zero the
+    /// decrement is skipped; if the node is also a leaf it is removed
+    /// unconditionally.
     pub fn release(&mut self, blocks: &[BlockId]) {
         for &bid in blocks {
             let Some(&idx) = self.block_to_node.get(&bid) else { continue };
