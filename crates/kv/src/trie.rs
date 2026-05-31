@@ -300,8 +300,15 @@ impl<const B: usize> DualRadixTrie<B> {
     /// are retained for routing even at rc=0. If `rc` is already zero the
     /// decrement is skipped; if the node is also a leaf it is removed
     /// unconditionally.
+    ///
+    /// Blocks are processed in **reverse** order (deepest / most-recent first)
+    /// so that when a leaf node is removed and its parent's `children` map is
+    /// updated, the parent is subsequently processed and may itself become
+    /// removable.  Processing shallowest-first could leave an interior node
+    /// alive (because it still had a child at the time of the check) even
+    /// though all of its children are removed in the same call.
     pub fn release(&mut self, blocks: &[BlockId]) {
-        for &bid in blocks {
+        for &bid in blocks.iter().rev() {
             let Some(&idx) = self.block_to_node.get(&bid) else { continue };
             let node = self.arena[idx].as_mut().unwrap();
             if node.rc > 0 {
