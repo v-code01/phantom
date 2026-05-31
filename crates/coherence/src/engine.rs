@@ -83,6 +83,9 @@ impl<const B: usize> CoherenceEngine<B> {
         }
         entry.state = crate::MesiState::Exclusive;
         entry.owner = Some(agent);
+        // blocks was cleared by invalidate(); tokens must match (blocks.len() * B == 0).
+        // Clear the stale token sequence so the tokens/blocks size invariant holds.
+        entry.tokens.clear();
         debug_assert!(entry.invariants_hold(k_bound));
         Ok(())
     }
@@ -94,7 +97,10 @@ impl<const B: usize> CoherenceEngine<B> {
     /// already Invalid (double-invalidate is an error, not a no-op).
     ///
     /// Clears owner, sharers, and blocks. Does NOT clear `seen`, matching the
-    /// TLA+ UNCHANGED <<seen>> invariant in the Invalidate action.
+    /// TLA+ UNCHANGED <<seen>> invariant in the Invalidate action. The `tokens`
+    /// field is also left stale after invalidation — it retains the token
+    /// sequence from the last valid state. Callers should not read `tokens`
+    /// from an Invalid entry.
     ///
     /// # M1 limitation
     /// `kv.evict(n)` sweeps the global LRU rather than freeing this artifact's
@@ -239,6 +245,11 @@ impl<const B: usize> CoherenceEngine<B> {
         let blocks = self.kv.fork(tokens);
         // tokens.to_vec() is the caller's intended sequence; blocks.len() * B is
         // what's actually cached. Store only the cached portion in entry.tokens.
+        debug_assert!(
+            blocks.len() * B <= tokens.len(),
+            "kv.fork() returned more blocks ({}) than tokens ({}) / B ({}) allows",
+            blocks.len(), tokens.len(), B
+        );
         let cached_tokens = tokens[..blocks.len() * B].to_vec();
         let entry = ArtifactEntry::new_exclusive(agent, blocks, cached_tokens);
         debug_assert!(entry.invariants_hold(self.k_bound));
@@ -251,6 +262,15 @@ impl<const B: usize> CoherenceEngine<B> {
     pub fn check_invariants(&self) -> Result<(), ArtifactId> {
         for (&id, entry) in &self.artifacts {
             if !entry.invariants_hold(self.k_bound) {
+                return Err(id);
+            }
+            // tokens.len() must equal blocks.len() * B for live entries.
+            // Invalid entries have blocks.clear() called but tokens is left
+            // stale intentionally (mirrors the UNCHANGED <<seen>> rationale),
+            // so skip this check for Invalid state.
+            if entry.state != crate::MesiState::Invalid
+                && entry.tokens.len() != entry.blocks.len() * B
+            {
                 return Err(id);
             }
         }
