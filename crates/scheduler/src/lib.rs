@@ -39,6 +39,10 @@ impl<const B: usize> Scheduler<B> {
         self.engine.check_invariants()
     }
 
+    /// Route a request through the cache and return the artifact ID and block list.
+    ///
+    /// After a successful cold-miss registration, the artifact is left in Shared state.
+    /// Callers that later need to extend it must call `invalidate()` + `acquire()` first.
     pub fn handle(&self, req: &Request) -> Result<Response, SchedulerError> {
         match self.router.route(&req.tokens) {
             Some(hit) => {

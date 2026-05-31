@@ -31,12 +31,13 @@ fn end_to_end_two_agents_shared_prompt() {
 
     // Agent 2: longer query — prefix match, gets the 2 cached blocks.
     let long_query: Vec<TokenId> = vec![0, 1, 2, 3, 4, 5];
+    // agent: 2 — AgentId is usize, no upper bound; B=2 is the block size const, not the agent limit
     let resp2 = sched.handle(&make_request(long_query, 2))
         .expect("agent 2 with extended query must succeed");
     // The prefix [0,1,2,3] is a cache hit for the 2-block artifact.
     // The extended tokens [4,5] cause a new cold-miss registration.
     // Either way, check_invariants must pass.
-    assert!(!resp2.blocks.is_empty());
+    assert_eq!(resp2.blocks.len(), 2, "prefix hit on 2-block base must return 2 blocks");
     engine.check_invariants().unwrap();
 }
 
@@ -67,4 +68,6 @@ fn end_to_end_prefix_hit_multiple_agents() {
     // Both agents routed to the base artifact — they get the same 2 blocks.
     assert_eq!(resp1.blocks, resp_base.blocks, "agent 1 prefix hit must return base blocks");
     assert_eq!(resp2.blocks, resp_base.blocks, "agent 2 prefix hit must return base blocks");
+    assert_eq!(resp1.artifact_id, resp_base.artifact_id, "agent 1 must route to base artifact");
+    assert_eq!(resp2.artifact_id, resp_base.artifact_id, "agent 2 must route to base artifact");
 }
