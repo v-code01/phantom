@@ -43,6 +43,9 @@ impl<const B: usize> Scheduler<B> {
     ///
     /// After a successful cold-miss registration, the artifact is left in Shared state.
     /// Callers that later need to extend it must call `invalidate()` + `acquire()` first.
+    ///
+    /// On a cache hit, `WrongState` can be returned if another agent concurrently
+    /// invalidates or modifies the artifact between the route probe and the read.
     pub fn handle(&self, req: &Request) -> Result<Response, SchedulerError> {
         match self.router.route(&req.tokens) {
             Some(hit) => {

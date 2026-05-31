@@ -113,9 +113,10 @@ impl<const B: usize> KvCache<B> {
     /// routing cleanup; calls slab.decref for every block unconditionally.
     /// Contrast with evict() which sweeps global LRU regardless of ownership.
     ///
-    /// Caller must pass blocks obtained from a prior `fork()` call on this cache.
-    /// Passing blocks from `lookup()` without a matching `fork()` will undercount
-    /// the reference and corrupt the slab.
+    /// `blocks` must represent exactly one outstanding slab reference owned by
+    /// this logical artifact — either from `alloc()` for a registered owner, or
+    /// from `slab.incref()` for a fork holder. Passing the same block list twice
+    /// (double-release) will undercount the reference and corrupt the slab.
     pub fn release(&mut self, blocks: &[BlockId]) {
         self.trie.release(blocks);
         for &id in blocks {

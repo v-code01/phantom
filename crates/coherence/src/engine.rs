@@ -100,7 +100,9 @@ impl<const B: usize> CoherenceEngine<B> {
     /// TLA+ UNCHANGED <<seen>> invariant in the Invalidate action. The `tokens`
     /// field is also left stale after invalidation — it retains the token
     /// sequence from the last valid state. Callers should not read `tokens`
-    /// from an Invalid entry.
+    /// from an Invalid entry. `acquire()` clears `tokens` as part of the
+    /// Invalid → Exclusive transition, restoring the `tokens.len() == blocks.len() * B`
+    /// invariant before any new write.
     ///
     /// Uses `kv.release()` for targeted per-artifact block release rather than
     /// the global LRU sweep used by the deprecated `kv.evict()` path.
@@ -273,7 +275,7 @@ impl<const B: usize> CoherenceEngine<B> {
             if matched == 0 {
                 continue;
             }
-            let better = best.as_ref().map_or(true, |b| {
+            let better = best.as_ref().is_none_or(|b| {
                 matched > b.matched_tokens
                     || (matched == b.matched_tokens && id.0 < b.artifact_id.0)
             });
@@ -745,6 +747,32 @@ mod tests {
         let result = e.lookup(&[0u32, 1, 99]).expect("1-block match must be found");
         assert_eq!(result.matched_tokens, 2);
         assert_eq!(result.blocks.len(), 1);
+    }
+
+    #[test]
+    fn fork_artifact_stays_readable_after_source_invalidated() {
+        // Regression: invalidating the source artifact must not corrupt the fork's slab
+        // references. The fork holds its own incref on the shared prefix blocks.
+        let mut e = CoherenceEngine::<2>::new_heap(16, 4, 5);
+        let base_tokens: Vec<kv::TokenId> = vec![0, 1, 2, 3];
+        let d = make_kv_data(2);
+        let s: Vec<&[u8]> = d.iter().map(|v| v.as_slice()).collect();
+        let base_id = e.register(&base_tokens, &s, 0).unwrap();
+
+        let fork_tokens: Vec<kv::TokenId> = vec![0, 1, 2, 3, 4, 5];
+        let fork_id = e.register_fork(&fork_tokens, base_id, 1).unwrap();
+        let data_fork = make_kv_data(3);
+        let slices_fork: Vec<&[u8]> = data_fork.iter().map(|v| v.as_slice()).collect();
+        e.write(fork_id, 1, &fork_tokens, &slices_fork).unwrap();
+        e.writeback(fork_id).unwrap();
+
+        // Invalidate the source artifact; the fork must still be readable.
+        e.invalidate(base_id).unwrap();
+        e.check_invariants().unwrap();
+
+        let blocks = e.read(fork_id, 2)
+            .expect("fork must remain readable after source is invalidated");
+        assert_eq!(blocks.len(), 3, "fork must expose all 3 blocks");
     }
 
     #[test]
