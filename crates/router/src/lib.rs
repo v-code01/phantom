@@ -27,13 +27,13 @@ impl<const B: usize> Clone for Router<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kv::TokenId;
 
     fn make_engine() -> coherence::SyncEngine<2> {
         coherence::SyncEngine::<2>::new_heap(16, 4, 5)
     }
 
     fn make_data(n: usize) -> Vec<Vec<u8>> {
+        // 8 bytes = B * element_stride where B=2, element_stride=4
         (0..n).map(|i| vec![i as u8; 8]).collect()
     }
 
