@@ -21,6 +21,9 @@ pub struct DualRadixTrie<const B: usize> {
     free_slots: Vec<usize>,
     root_children: HashMap<u64, usize>,
     clock: u64,
+    /// Reverse map: BlockId → arena index. Populated on insert, removed on
+    /// evict_lru or release. Enables O(1) targeted node lookup for release().
+    block_to_node: HashMap<BlockId, usize>,
 }
 
 impl<const B: usize> DualRadixTrie<B> {
@@ -30,6 +33,7 @@ impl<const B: usize> DualRadixTrie<B> {
             free_slots: Vec::new(),
             root_children: HashMap::new(),
             clock: 0,
+            block_to_node: HashMap::new(),
         }
     }
 
@@ -170,6 +174,7 @@ impl<const B: usize> DualRadixTrie<B> {
                 last_used: clock,
             };
             let new_idx = self.alloc_node(new_node);
+            self.block_to_node.insert(block_id, new_idx);
 
             match current_parent {
                 Some(p) => {
@@ -255,32 +260,57 @@ impl<const B: usize> DualRadixTrie<B> {
 
         let mut freed = Vec::new();
         for (_, idx) in evictable.into_iter().take(target) {
-            let node = self.arena[idx].take().unwrap();
+            let node = self.remove_node(idx);
             freed.push(node.block_id);
-
-            // Unlink from parent — but guard against the collision-orphan case:
-            // a true xxh3 collision can cause a live node to overwrite the
-            // parent's child pointer. Only remove if the parent still maps
-            // node.parent_key to THIS node's index.
-            match node.parent_idx {
-                Some(parent_idx) => {
-                    if let Some(p) = self.arena[parent_idx].as_mut() {
-                        if p.children.get(&node.parent_key) == Some(&idx) {
-                            p.children.remove(&node.parent_key);
-                        }
-                    }
-                }
-                None => {
-                    if self.root_children.get(&node.parent_key) == Some(&idx) {
-                        self.root_children.remove(&node.parent_key);
-                    }
-                }
-            }
-
-            self.free_slots.push(idx);
+            self.block_to_node.remove(&node.block_id);
         }
 
         freed
+    }
+
+    /// Remove a node from the arena and unlink it from its parent. Returns the
+    /// evicted `TrieNode`. Does NOT update `block_to_node` — the caller must do
+    /// that after inspecting the returned node's `block_id`.
+    ///
+    /// Guards against the collision-orphan case: a true xxh3 collision can
+    /// cause a live node to overwrite the parent's child pointer. Only removes
+    /// from the parent map when parent.children[node.parent_key] still points
+    /// to THIS node's index.
+    fn remove_node(&mut self, idx: usize) -> TrieNode {
+        let node = self.arena[idx].take().unwrap();
+        match node.parent_idx {
+            Some(parent_idx) => {
+                if let Some(p) = self.arena[parent_idx].as_mut() {
+                    if p.children.get(&node.parent_key) == Some(&idx) {
+                        p.children.remove(&node.parent_key);
+                    }
+                }
+            }
+            None => {
+                if self.root_children.get(&node.parent_key) == Some(&idx) {
+                    self.root_children.remove(&node.parent_key);
+                }
+            }
+        }
+        self.free_slots.push(idx);
+        node
+    }
+
+    /// Decrement rc for each block in `blocks`. Remove a node from the arena
+    /// when rc reaches zero and the node has no children. Nodes with children
+    /// are retained for routing even at rc=0.
+    pub fn release(&mut self, blocks: &[BlockId]) {
+        for &bid in blocks {
+            let Some(&idx) = self.block_to_node.get(&bid) else { continue };
+            let node = self.arena[idx].as_mut().unwrap();
+            if node.rc > 0 {
+                node.rc -= 1;
+            }
+            if node.rc == 0 && node.children.is_empty() {
+                self.remove_node(idx);
+                self.block_to_node.remove(&bid);
+            }
+        }
     }
 }
 
@@ -471,5 +501,46 @@ mod tests {
             !freed.contains(&BlockId(10)),
             "interior forked node A must not be evicted even if rc guard were absent"
         );
+    }
+
+    #[test]
+    fn release_leaf_with_rc_zero_removes_node() {
+        let mut trie = DualRadixTrie::<4>::new();
+        trie.insert(&seq::<4>(&[0]), &[BlockId(0)]);
+        // rc=0, leaf — release must remove it
+        trie.release(&[BlockId(0)]);
+        let result = trie.lookup(&seq::<4>(&[0]));
+        assert_eq!(result.matched_tokens, 0, "released node must be unreachable via lookup");
+    }
+
+    #[test]
+    fn release_leaf_with_rc_one_decrements_and_removes() {
+        let mut trie = DualRadixTrie::<4>::new();
+        trie.insert(&seq::<4>(&[0]), &[BlockId(0)]);
+        trie.fork(&seq::<4>(&[0])); // rc → 1
+        // rc=1 → decrement → 0, still leaf → remove
+        trie.release(&[BlockId(0)]);
+        let result = trie.lookup(&seq::<4>(&[0]));
+        assert_eq!(result.matched_tokens, 0, "forked node released to rc=0 must be unreachable");
+    }
+
+    #[test]
+    fn release_interior_node_stays_when_has_children() {
+        let mut trie = DualRadixTrie::<4>::new();
+        // 2-block chain: [0] → [1]
+        trie.insert(&seq::<4>(&[0, 1]), &[BlockId(0), BlockId(1)]);
+        trie.fork(&seq::<4>(&[0])); // rc on [0] → 1
+        // Release [0]: rc → 0 but has child [1] → must NOT be removed
+        trie.release(&[BlockId(0)]);
+        // Full 2-block chain still reachable
+        let result = trie.lookup(&seq::<4>(&[0, 1]));
+        assert_eq!(result.matched_tokens, 8, "interior node with children must survive release");
+    }
+
+    #[test]
+    fn release_noop_for_unknown_blockid() {
+        let mut trie = DualRadixTrie::<4>::new();
+        // release on empty trie must not panic
+        trie.release(&[BlockId(99)]);
     }
 }
