@@ -1,5 +1,7 @@
 pub(crate) mod engine;
 pub(crate) mod entry;
+pub mod sync;
+pub use sync::SyncEngine;
 
 pub use engine::CoherenceEngine;
 
