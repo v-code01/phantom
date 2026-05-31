@@ -27,10 +27,15 @@ pub struct BlockSlab<const B: usize> {
 // BlockSlab. Single-threaded use in M1; Sync impl deferred to M3.
 unsafe impl<const B: usize> Send for BlockSlab<B> {}
 
-// SAFETY: data_ptr is only written via alloc()/decref() which take &mut self and
-// are serialized by the Mutex on CoherenceEngine. commit_block() and block_ptr()
-// take &self and operate on non-overlapping slab offsets; the SeqCst store/load
-// pair on `committed` provides visibility for the I5 invariant across threads.
+// SAFETY: `data_ptr` is set once in `from_raw()` and never reassigned; the
+// pointer itself is immutable after construction, so sharing it across threads
+// is safe. Writes through it via `commit_block()` operate on non-overlapping
+// offsets (id.0 * B * element_stride), so two concurrent commit_block() calls
+// on distinct BlockIds cannot alias. The SeqCst store/load pair on `committed`
+// ensures a reader via block_ptr() that observes committed=true sees all bytes
+// written by commit_block(). Mutable metadata (free_list, ref_counts) is only
+// accessed via &mut self methods (alloc, decref) serialized externally by the
+// Mutex in SyncEngine.
 unsafe impl<const B: usize> Sync for BlockSlab<B> {}
 
 impl<const B: usize> BlockSlab<B> {
@@ -87,10 +92,9 @@ impl<const B: usize> BlockSlab<B> {
 
     /// Increment the reference count for `id`.
     ///
-    /// At M1 `KvCache::fork` tracks fork counts via the trie's `rc` field and does
-    /// NOT call this method; the slab ref count is always 1 for every live block.
-    /// M3 will wire `incref`/`decref` symmetrically with fork/release so the slab
-    /// layer becomes the authoritative reference-count source.
+    /// Called by `KvCache::fork()` for each block in the fork. The symmetric
+    /// `KvCache::release()` calls `decref()`. Ref-count invariant: every live
+    /// block in a registered or forked artifact has slab rc >= 1.
     pub fn incref(&self, id: BlockId) {
         self.ref_counts[id.0].fetch_add(1, Ordering::Relaxed);
     }

@@ -112,6 +112,10 @@ impl<const B: usize> KvCache<B> {
     /// Release blocks belonging to a specific artifact. Decrements trie rc for
     /// routing cleanup; calls slab.decref for every block unconditionally.
     /// Contrast with evict() which sweeps global LRU regardless of ownership.
+    ///
+    /// Caller must pass blocks obtained from a prior `fork()` call on this cache.
+    /// Passing blocks from `lookup()` without a matching `fork()` will undercount
+    /// the reference and corrupt the slab.
     pub fn release(&mut self, blocks: &[BlockId]) {
         self.trie.release(blocks);
         for &id in blocks {
@@ -152,7 +156,11 @@ mod tests {
     }
 
     #[test]
-    fn fork_then_release_original_leaves_fork_accessible() {
+    fn fork_then_release_original_preserves_slab_refcount() {
+        // After releasing the original's blocks, trie routing to those blocks is gone
+        // (trie.release() removes the leaf nodes). But the SLAB blocks are still live
+        // because the fork still holds a slab reference (slab rc went from 2 to 1).
+        // This test verifies slab ref-count correctness; trie routing is separate.
         // B=2, capacity=4
         let mut kv = KvCache::<2>::new_heap(4, 4);
         let tokens: Vec<u32> = vec![0, 1, 2, 3];
