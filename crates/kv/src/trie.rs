@@ -307,6 +307,12 @@ impl<const B: usize> DualRadixTrie<B> {
     /// removable.  Processing shallowest-first could leave an interior node
     /// alive (because it still had a child at the time of the check) even
     /// though all of its children are removed in the same call.
+    ///
+    /// # Precondition
+    /// `blocks` must be ordered shallowest-first (trie-insertion order), as returned
+    /// by `lookup()` / `fork()`. Release processes blocks in reverse (deepest-first),
+    /// so interior nodes observe their children as already removed before being
+    /// evaluated for cleanup.
     pub fn release(&mut self, blocks: &[BlockId]) {
         for &bid in blocks.iter().rev() {
             let Some(&idx) = self.block_to_node.get(&bid) else { continue };
@@ -550,5 +556,19 @@ mod tests {
         let mut trie = DualRadixTrie::<4>::new();
         // release on empty trie must not panic
         trie.release(&[BlockId(99)]);
+    }
+
+    #[test]
+    fn release_chain_removes_parent_after_last_child_released() {
+        let mut trie = DualRadixTrie::<4>::new();
+        // 2-block chain: [0] parent → [1] child
+        trie.insert(&seq::<4>(&[0, 1]), &[BlockId(0), BlockId(1)]);
+        // Release both blocks in shallowest-first order — parent and child should both be removed
+        trie.release(&[BlockId(0), BlockId(1)]);
+        // Neither block should be reachable
+        let r1 = trie.lookup(&seq::<4>(&[0]));
+        let r2 = trie.lookup(&seq::<4>(&[0, 1]));
+        assert_eq!(r1.matched_tokens, 0, "parent must be removed after chain release");
+        assert_eq!(r2.matched_tokens, 0, "child must be removed after chain release");
     }
 }

@@ -32,15 +32,21 @@ impl<const B: usize> Scheduler<B> {
         Self { engine, router }
     }
 
-    pub fn handle(&self, req: &Request) -> Result<Response, SchedulerError> {
-        let kv_slices: Vec<&[u8]> = req.kv_data.iter().map(|v| v.as_slice()).collect();
+    /// Delegate to the underlying engine's invariant checker.
+    /// Returns `Ok(())` if all artifact state is consistent, or
+    /// `Err(artifact_id)` identifying the first offending artifact.
+    pub fn check_invariants(&self) -> Result<(), coherence::ArtifactId> {
+        self.engine.check_invariants()
+    }
 
+    pub fn handle(&self, req: &Request) -> Result<Response, SchedulerError> {
         match self.router.route(&req.tokens) {
             Some(hit) => {
                 let blocks = self.read_with_recovery(hit.artifact_id, req.agent, req)?;
                 Ok(Response { artifact_id: hit.artifact_id, blocks })
             }
             None => {
+                let kv_slices: Vec<&[u8]> = req.kv_data.iter().map(|v| v.as_slice()).collect();
                 let id = self.engine
                     .register(&req.tokens, &kv_slices, req.agent)
                     .map_err(SchedulerError::Coherence)?;
@@ -82,7 +88,7 @@ impl<const B: usize> Scheduler<B> {
         self.engine.acquire(id, agent).map_err(SchedulerError::Coherence)?;
         self.engine.write(id, agent, &req.tokens, &kv_slices).map_err(SchedulerError::Coherence)?;
         self.engine.writeback(id).map_err(SchedulerError::Coherence)?;
-        self.engine.read(id, agent).map_err(|e| SchedulerError::RecoveryFailed(e))
+        self.engine.read(id, agent).map_err(SchedulerError::RecoveryFailed)
     }
 }
 
@@ -151,5 +157,6 @@ mod tests {
         let req = make_request(ext_tokens, 1);
         let resp = sched.handle(&req).expect("K-bound recovery must succeed");
         assert!(!resp.blocks.is_empty(), "recovery must return valid blocks");
+        sched.check_invariants().expect("engine invariants must hold after K-bound recovery");
     }
 }
