@@ -1,0 +1,115 @@
+    Finished `bench` profile [optimized] target(s) in 0.11s
+     Running benches/serving.rs (target/release/deps/serving-5429b6291ee7d8ae)
+Gnuplot not found, using plotters backend
+Benchmarking scheduler_cache_hit/heap
+Benchmarking scheduler_cache_hit/heap: Warming up for 3.0000 s
+Benchmarking scheduler_cache_hit/heap: Collecting 100 samples in estimated 5.0003 s (61M iterations)
+Benchmarking scheduler_cache_hit/heap: Analyzing
+scheduler_cache_hit/heap
+                        time:   [82.776 ns 83.167 ns 83.592 ns]
+                        change: [+5.5901% +6.2632% +6.8988%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 10 outliers among 100 measurements (10.00%)
+  1 (1.00%) low mild
+  6 (6.00%) high mild
+  3 (3.00%) high severe
+Benchmarking scheduler_cache_hit/metal
+Benchmarking scheduler_cache_hit/metal: Warming up for 3.0000 s
+Benchmarking scheduler_cache_hit/metal: Collecting 100 samples in estimated 5.0003 s (61M iterations)
+Benchmarking scheduler_cache_hit/metal: Analyzing
+scheduler_cache_hit/metal
+                        time:   [81.468 ns 81.838 ns 82.235 ns]
+                        change: [+4.4636% +5.0509% +5.6128%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 4 outliers among 100 measurements (4.00%)
+  3 (3.00%) high mild
+  1 (1.00%) high severe
+
+Benchmarking scheduler_cold_miss/heap
+Benchmarking scheduler_cold_miss/heap: Warming up for 3.0000 s
+Benchmarking scheduler_cold_miss/heap: Collecting 100 samples in estimated 5.1898 s (61k iterations)
+Benchmarking scheduler_cold_miss/heap: Analyzing
+scheduler_cold_miss/heap
+                        time:   [1.5063 µs 1.6143 µs 1.7063 µs]
+Benchmarking scheduler_cold_miss/metal
+Benchmarking scheduler_cold_miss/metal: Warming up for 3.0000 s
+Benchmarking scheduler_cold_miss/metal: Collecting 100 samples in estimated 5.3584 s (61k iterations)
+Benchmarking scheduler_cold_miss/metal: Analyzing
+scheduler_cold_miss/metal
+                        time:   [1.6188 µs 1.7259 µs 1.8215 µs]
+
+Benchmarking lookup_n_artifacts/lookup/1
+Benchmarking lookup_n_artifacts/lookup/1: Warming up for 3.0000 s
+Benchmarking lookup_n_artifacts/lookup/1: Collecting 100 samples in estimated 5.0001 s (184M iterations)
+Benchmarking lookup_n_artifacts/lookup/1: Analyzing
+lookup_n_artifacts/lookup/1
+                        time:   [27.081 ns 27.167 ns 27.256 ns]
+Found 9 outliers among 100 measurements (9.00%)
+  1 (1.00%) low mild
+  6 (6.00%) high mild
+  2 (2.00%) high severe
+Benchmarking lookup_n_artifacts/lookup/10
+Benchmarking lookup_n_artifacts/lookup/10: Warming up for 3.0000 s
+Benchmarking lookup_n_artifacts/lookup/10: Collecting 100 samples in estimated 5.0000 s (129M iterations)
+Benchmarking lookup_n_artifacts/lookup/10: Analyzing
+lookup_n_artifacts/lookup/10
+                        time:   [37.860 ns 38.066 ns 38.294 ns]
+Found 2 outliers among 100 measurements (2.00%)
+  1 (1.00%) high mild
+  1 (1.00%) high severe
+Benchmarking lookup_n_artifacts/lookup/100
+Benchmarking lookup_n_artifacts/lookup/100: Warming up for 3.0000 s
+Benchmarking lookup_n_artifacts/lookup/100: Collecting 100 samples in estimated 5.0004 s (34M iterations)
+Benchmarking lookup_n_artifacts/lookup/100: Analyzing
+lookup_n_artifacts/lookup/100
+                        time:   [146.74 ns 147.59 ns 148.58 ns]
+Found 4 outliers among 100 measurements (4.00%)
+  2 (2.00%) high mild
+  2 (2.00%) high severe
+Benchmarking lookup_n_artifacts/lookup/1000
+Benchmarking lookup_n_artifacts/lookup/1000: Warming up for 3.0000 s
+Benchmarking lookup_n_artifacts/lookup/1000: Collecting 100 samples in estimated 5.0093 s (1.8M iterations)
+Benchmarking lookup_n_artifacts/lookup/1000: Analyzing
+lookup_n_artifacts/lookup/1000
+                        time:   [2.8388 µs 2.9085 µs 2.9963 µs]
+Found 11 outliers among 100 measurements (11.00%)
+  4 (4.00%) high mild
+  7 (7.00%) high severe
+
+Benchmarking commit_block_throughput/heap
+Benchmarking commit_block_throughput/heap: Warming up for 3.0000 s
+Benchmarking commit_block_throughput/heap: Collecting 100 samples in estimated 5.0000 s (468M iterations)
+Benchmarking commit_block_throughput/heap: Analyzing
+commit_block_throughput/heap
+                        time:   [10.216 ns 10.290 ns 10.368 ns]
+                        thrpt:  [91.987 GiB/s 92.681 GiB/s 93.350 GiB/s]
+Found 8 outliers among 100 measurements (8.00%)
+  6 (6.00%) low mild
+  2 (2.00%) high severe
+Benchmarking commit_block_throughput/metal
+Benchmarking commit_block_throughput/metal: Warming up for 3.0000 s
+Benchmarking commit_block_throughput/metal: Collecting 100 samples in estimated 5.0000 s (427M iterations)
+Benchmarking commit_block_throughput/metal: Analyzing
+commit_block_throughput/metal
+                        time:   [10.076 ns 10.124 ns 10.184 ns]
+                        thrpt:  [93.645 GiB/s 94.204 GiB/s 94.644 GiB/s]
+Found 7 outliers among 100 measurements (7.00%)
+  7 (7.00%) high mild
+
+Benchmarking slab_alloc_decref/heap
+Benchmarking slab_alloc_decref/heap: Warming up for 3.0000 s
+Benchmarking slab_alloc_decref/heap: Collecting 100 samples in estimated 5.0000 s (1.3B iterations)
+Benchmarking slab_alloc_decref/heap: Analyzing
+slab_alloc_decref/heap  time:   [10.408 ns 13.740 ns 18.087 ns]
+Found 4 outliers among 100 measurements (4.00%)
+  3 (3.00%) high mild
+  1 (1.00%) high severe
+Benchmarking slab_alloc_decref/metal
+Benchmarking slab_alloc_decref/metal: Warming up for 3.0000 s
+Benchmarking slab_alloc_decref/metal: Collecting 100 samples in estimated 5.0002 s (28M iterations)
+Benchmarking slab_alloc_decref/metal: Analyzing
+slab_alloc_decref/metal time:   [103.45 ns 143.53 ns 188.33 ns]
+Found 13 outliers among 100 measurements (13.00%)
+  5 (5.00%) high mild
+  8 (8.00%) high severe
+

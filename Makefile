@@ -1,4 +1,4 @@
-.PHONY: test test-hardware clippy build verify-tla benchmark clean verify-dafny
+.PHONY: test test-hardware clippy build verify-tla benchmark bench clean verify-dafny
 
 test:
 	cargo test --workspace
@@ -19,6 +19,10 @@ verify-tla:
 benchmark:
 	@command -v python3 >/dev/null 2>&1 || { echo "python3 required"; exit 1; }
 	python3 scripts/baseline_benchmark.py --seed 42 --output bench_results/baseline_$$(date +%Y-%m-%d).json
+
+bench:
+	mkdir -p bench_results
+	cargo bench -p bench --bench serving -- --save-baseline phantom_m4 2>&1 | tee bench_results/phantom_$(shell date +%Y-%m-%d).txt
 
 clean:
 	cargo clean
