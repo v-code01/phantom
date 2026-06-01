@@ -9,6 +9,12 @@ pub struct Request {
     pub agent:   AgentId,
 }
 
+/// Result of [`Scheduler::handle`].
+///
+/// `cache_hit` is `true` when the router found an existing artifact with a matching
+/// token prefix (including after k-bound recovery — the artifact existed, the agent's
+/// version was simply stale). `cache_hit` is `false` only on a cold registration where
+/// no prior artifact covered the request tokens.
 pub struct Response {
     pub artifact_id: ArtifactId,
     pub blocks:      Vec<BlockId>,
@@ -165,6 +171,7 @@ mod tests {
         let req = make_request(ext_tokens, 1);
         let resp = sched.handle(&req).expect("K-bound recovery must succeed");
         assert!(!resp.blocks.is_empty(), "recovery must return valid blocks");
+        assert!(resp.cache_hit, "k-bound recovery is still a cache hit — artifact was registered");
         sched.check_invariants().expect("engine invariants must hold after K-bound recovery");
     }
 
