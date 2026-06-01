@@ -2,7 +2,7 @@ pub mod block;
 pub mod cache;
 pub mod trie;
 
-pub use block::BlockError;
+pub use block::{BlockError, BlockSlab};
 pub use cache::{CacheError, KvCache};
 pub use trie::DualRadixTrie;
 

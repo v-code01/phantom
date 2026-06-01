@@ -6,4 +6,13 @@ edition = "2021"
 [dependencies]
 
 [dev-dependencies]
-proptest = { workspace = true }
+criterion  = { workspace = true }
+scheduler  = { path = "../scheduler" }
+kv         = { path = "../kv" }
+coherence  = { path = "../coherence" }
+metal      = { workspace = true }
+proptest   = { workspace = true }
+
+[[bench]]
+name    = "serving"
+harness = false
