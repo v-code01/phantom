@@ -135,7 +135,36 @@ fn bench_lookup_n_artifacts(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_commit_block_throughput(_c: &mut Criterion) {}
+fn bench_commit_block_throughput(c: &mut Criterion) {
+    // Stack-allocated 1024-byte source buffer (B=16 × STRIDE=64).
+    let src = [0u8; B * STRIDE];
+
+    let mut group = c.benchmark_group("commit_block_throughput");
+    // Report GB/s alongside ns/iter in Criterion output.
+    group.throughput(Throughput::Bytes((B * STRIDE) as u64));
+
+    // --- heap variant ---
+    {
+        let mut slab = BlockSlab::<B>::new_heap(1_024, STRIDE);
+        let id = slab.alloc().expect("fresh slab must yield a block");
+        group.bench_function("heap", |b| {
+            b.iter(|| unsafe { slab.commit_block(black_box(id), src.as_ptr()) })
+        });
+    }
+
+    // --- metal variant ---
+    {
+        let device = metal::Device::system_default()
+            .expect("no Metal device — PHANTOM benchmarks require Apple Silicon");
+        let mut slab = BlockSlab::<B>::new(&device, 1_024, STRIDE);
+        let id = slab.alloc().expect("fresh slab must yield a block");
+        group.bench_function("metal", |b| {
+            b.iter(|| unsafe { slab.commit_block(black_box(id), src.as_ptr()) })
+        });
+    }
+
+    group.finish();
+}
 
 fn bench_slab_alloc_decref(_c: &mut Criterion) {}
 
