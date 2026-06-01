@@ -107,6 +107,12 @@ fn bench_scheduler_cold_miss(c: &mut Criterion) {
 
 fn bench_lookup_n_artifacts(c: &mut Criterion) {
     // Heap only — isolates O(n) algorithmic cost from Metal throughput.
+    //
+    // Artifacts use disjoint token sequences (artifact i = i*32..(i+1)*32) per spec.
+    // The query (0..32) matches only artifact 0; all others fail on their first token.
+    // This measures HashMap iteration overhead (O(n) entries scanned), not prefix-scan
+    // depth — which is intentional: the benchmark establishes when an O(1) routing index
+    // (deferred to M5) becomes faster than the O(n) linear scan.
     let query_tokens: Vec<u32> = (0u32..32).collect();
     let kv_data = make_kv_data(2);
     let kv_slices: Vec<&[u8]> = kv_data.iter().map(|v| v.as_slice()).collect();
@@ -129,8 +135,8 @@ fn bench_lookup_n_artifacts(c: &mut Criterion) {
 }
 
 fn bench_commit_block_throughput(c: &mut Criterion) {
-    // Stack-allocated 1024-byte source buffer (B=16 × STRIDE=64).
-    let src = [0u8; B * STRIDE];
+    // Non-zero source buffer: prevents compiler from emitting bzero instead of memcpy.
+    let src: [u8; B * STRIDE] = std::array::from_fn(|i| i as u8);
 
     let mut group = c.benchmark_group("commit_block_throughput");
     // Report GB/s alongside ns/iter in Criterion output.
@@ -171,8 +177,11 @@ fn bench_slab_alloc_decref(c: &mut Criterion) {
             b.iter_batched(
                 || (),
                 |_| {
-                    let id = black_box(slab.borrow_mut().alloc()).unwrap();
-                    slab.borrow_mut().decref(black_box(id));
+                    // Single borrow_mut guard for both calls: one RefCell cycle,
+                    // matching production semantics (one Mutex lock, alloc + decref, unlock).
+                    let mut guard = slab.borrow_mut();
+                    let id = black_box(guard.alloc()).unwrap();
+                    guard.decref(black_box(id));
                 },
                 BatchSize::SmallInput,
             );
@@ -188,8 +197,9 @@ fn bench_slab_alloc_decref(c: &mut Criterion) {
             b.iter_batched(
                 || (),
                 |_| {
-                    let id = black_box(slab.borrow_mut().alloc()).unwrap();
-                    slab.borrow_mut().decref(black_box(id));
+                    let mut guard = slab.borrow_mut();
+                    let id = black_box(guard.alloc()).unwrap();
+                    guard.decref(black_box(id));
                 },
                 BatchSize::SmallInput,
             );

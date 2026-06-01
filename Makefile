@@ -22,7 +22,7 @@ benchmark:
 
 bench:
 	mkdir -p bench_results
-	cargo bench -p bench --bench serving -- --save-baseline phantom_m4 2>&1 | tee bench_results/phantom_$(shell date +%Y-%m-%d).txt
+	bash -c 'set -o pipefail; cargo bench -p bench --bench serving -- --save-baseline phantom_m4 2>&1 | tee bench_results/phantom_$(shell date +%Y-%m-%d).txt'
 
 clean:
 	cargo clean
