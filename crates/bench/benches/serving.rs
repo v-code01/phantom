@@ -1,9 +1,9 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
 
 use coherence::SyncEngine;
 use criterion::{
-    black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
+    black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
 };
 use kv::BlockSlab;
 use scheduler::{Request, Scheduler};
@@ -166,7 +166,45 @@ fn bench_commit_block_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_slab_alloc_decref(_c: &mut Criterion) {}
+fn bench_slab_alloc_decref(c: &mut Criterion) {
+    let mut group = c.benchmark_group("slab_alloc_decref");
+
+    // --- heap variant ---
+    // RefCell provides interior mutability: `alloc` and `decref` both take &mut self,
+    // so they cannot be called directly from a non-mut FnMut closure.
+    {
+        let slab = RefCell::new(BlockSlab::<B>::new_heap(1, STRIDE));
+        group.bench_function("heap", |b| {
+            b.iter_batched(
+                || (),
+                |_| {
+                    let id = black_box(slab.borrow_mut().alloc()).unwrap();
+                    slab.borrow_mut().decref(black_box(id));
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+
+    // --- metal variant ---
+    {
+        let device = metal::Device::system_default()
+            .expect("no Metal device — PHANTOM benchmarks require Apple Silicon");
+        let slab = RefCell::new(BlockSlab::<B>::new(&device, 1, STRIDE));
+        group.bench_function("metal", |b| {
+            b.iter_batched(
+                || (),
+                |_| {
+                    let id = black_box(slab.borrow_mut().alloc()).unwrap();
+                    slab.borrow_mut().decref(black_box(id));
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+
+    group.finish();
+}
 
 criterion_group!(
     benches,
