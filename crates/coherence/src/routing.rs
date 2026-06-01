@@ -1,6 +1,3 @@
-// Dead-code allowed until Task 2 wires RoutingIndex into CoherenceEngine.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use xxhash_rust::xxh3::xxh3_64;
 use kv::TokenId;

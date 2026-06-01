@@ -265,33 +265,6 @@ impl<const B: usize> CoherenceEngine<B> {
         Ok(new_id)
     }
 
-    /// Find the artifact in E or S state with the longest token prefix match
-    /// against `tokens`. Returns None if no readable artifact covers any prefix.
-    /// M and I artifacts are skipped.
-    ///
-    /// Delegates to `RoutingIndex::longest_prefix`. O(|tokens| / B).
-    #[must_use]
-    pub fn lookup(&self, tokens: &[kv::TokenId]) -> Option<crate::RouteResult> {
-        // Step 1: O(k) routing lookup — routing Mutex acquired then released.
-        let (artifact_id, matched_blocks) = {
-            let routing = self.routing.lock().unwrap();
-            routing.longest_prefix(tokens)
-        }?;
-        // routing Mutex released before acquiring the per-artifact Mutex (lock-ordering: artifact first).
-        // Step 2: read blocks from the per-artifact entry.
-        let entry_arc = self.artifacts.get(&artifact_id)?;
-        let entry = entry_arc.lock().unwrap();
-        if !matches!(entry.state, crate::MesiState::Exclusive | crate::MesiState::Shared) {
-            return None;
-        }
-        let blocks = entry.blocks[..matched_blocks].to_vec();
-        Some(crate::RouteResult {
-            artifact_id,
-            matched_tokens: matched_blocks * B,
-            blocks,
-        })
-    }
-
     /// Returns `(used_blocks, total_blocks)` for Prometheus metrics.
     pub fn stats(&self) -> (usize, usize) {
         let kv    = self.kv.lock().unwrap();

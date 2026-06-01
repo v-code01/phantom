@@ -55,6 +55,7 @@ impl<const B: usize> SyncEngine<B> {
     /// Hot path: holds only the outer Read lock. Two-step under Read lock:
     ///   1. routing Mutex (O(k) trie walk) — released before step 2.
     ///   2. per-artifact Mutex — checks state, reads blocks.
+    ///
     /// Different artifacts are fully concurrent under this path.
     #[must_use]
     pub fn lookup(&self, tokens: &[TokenId]) -> Option<RouteResult> {
