@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 coherence  = { path = "../coherence" }
 scheduler  = { path = "../scheduler" }
+kv         = { path = "../kv" }
 axum       = { workspace = true }
 tokio      = { workspace = true }
 serde      = { workspace = true }
