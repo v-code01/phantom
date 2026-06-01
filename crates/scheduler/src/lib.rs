@@ -12,6 +12,7 @@ pub struct Request {
 pub struct Response {
     pub artifact_id: ArtifactId,
     pub blocks:      Vec<BlockId>,
+    pub cache_hit:   bool,
 }
 
 #[derive(Debug)]
@@ -50,7 +51,7 @@ impl<const B: usize> Scheduler<B> {
         match self.router.route(&req.tokens) {
             Some(hit) => {
                 let blocks = self.read_with_recovery(hit.artifact_id, req.agent, req)?;
-                Ok(Response { artifact_id: hit.artifact_id, blocks })
+                Ok(Response { artifact_id: hit.artifact_id, blocks, cache_hit: true })
             }
             None => {
                 let kv_slices: Vec<&[u8]> = req.kv_data.iter().map(|v| v.as_slice()).collect();
@@ -60,7 +61,7 @@ impl<const B: usize> Scheduler<B> {
                 let blocks = self.engine
                     .read(id, req.agent)
                     .map_err(SchedulerError::Coherence)?;
-                Ok(Response { artifact_id: id, blocks })
+                Ok(Response { artifact_id: id, blocks, cache_hit: false })
             }
         }
     }
@@ -165,5 +166,19 @@ mod tests {
         let resp = sched.handle(&req).expect("K-bound recovery must succeed");
         assert!(!resp.blocks.is_empty(), "recovery must return valid blocks");
         sched.check_invariants().expect("engine invariants must hold after K-bound recovery");
+    }
+
+    #[test]
+    fn handle_reports_cache_hit_correctly() {
+        let engine = make_engine();
+        let sched = Scheduler::new(engine);
+        let req = make_request(vec![0, 1, 2, 3], 0);
+
+        let resp = sched.handle(&req).unwrap();
+        assert!(!resp.cache_hit, "first call must be a cold miss");
+
+        let req2 = make_request(vec![0, 1, 2, 3], 1);
+        let resp2 = sched.handle(&req2).unwrap();
+        assert!(resp2.cache_hit, "second call with same tokens must be a cache hit");
     }
 }
