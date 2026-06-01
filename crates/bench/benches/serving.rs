@@ -112,7 +112,28 @@ fn bench_scheduler_cold_miss(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_lookup_n_artifacts(_c: &mut Criterion) {}
+fn bench_lookup_n_artifacts(c: &mut Criterion) {
+    // Heap only — isolates O(n) algorithmic cost from Metal throughput.
+    let query_tokens: Vec<u32> = (0u32..32).collect();
+    let kv_data = make_kv_data(2);
+    let kv_slices: Vec<&[u8]> = kv_data.iter().map(|v| v.as_slice()).collect();
+
+    let mut group = c.benchmark_group("lookup_n_artifacts");
+
+    for &n in &[1usize, 10, 100, 1_000] {
+        // capacity = n * 4 blocks: 2 blocks per artifact × n artifacts + 2n headroom
+        let engine = SyncEngine::<B>::new_heap(n * 4, STRIDE, 100);
+        for i in 0..n {
+            let tokens: Vec<u32> = ((i as u32 * 32)..((i as u32 + 1) * 32)).collect();
+            engine.register(&tokens, &kv_slices, 0).unwrap();
+        }
+        group.bench_with_input(BenchmarkId::new("lookup", n), &n, |b, _| {
+            b.iter(|| engine.lookup(black_box(&query_tokens)))
+        });
+    }
+
+    group.finish();
+}
 
 fn bench_commit_block_throughput(_c: &mut Criterion) {}
 
