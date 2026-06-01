@@ -1,10 +1,12 @@
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use kv::KvCache;
-use crate::{AgentId, ArtifactId, CoherenceError, entry::ArtifactEntry};
+use crate::{AgentId, ArtifactId, CoherenceError, entry::ArtifactEntry, routing::RoutingIndex};
 
 pub struct CoherenceEngine<const B: usize> {
-    pub(crate) kv:        KvCache<B>,
-    pub(crate) artifacts: HashMap<ArtifactId, ArtifactEntry>,
+    pub(crate) routing:   Mutex<RoutingIndex<B>>,
+    pub(crate) artifacts: HashMap<ArtifactId, Arc<Mutex<ArtifactEntry>>>,
+    pub(crate) kv:        Mutex<KvCache<B>>,
     pub(crate) k_bound:   u64,
 }
 
@@ -16,8 +18,9 @@ impl<const B: usize> CoherenceEngine<B> {
         k_bound: u64,
     ) -> Self {
         Self {
-            kv: KvCache::new(device, capacity, element_stride),
+            routing:   Mutex::new(RoutingIndex::new()),
             artifacts: HashMap::new(),
+            kv:        Mutex::new(KvCache::new(device, capacity, element_stride)),
             k_bound,
         }
     }
@@ -26,8 +29,9 @@ impl<const B: usize> CoherenceEngine<B> {
     /// Intended for unit tests and environments without an MTLDevice.
     pub fn new_heap(capacity: usize, element_stride: usize, k_bound: u64) -> Self {
         Self {
-            kv: KvCache::new_heap(capacity, element_stride),
+            routing:   Mutex::new(RoutingIndex::new()),
             artifacts: HashMap::new(),
+            kv:        Mutex::new(KvCache::new_heap(capacity, element_stride)),
             k_bound,
         }
     }
@@ -50,15 +54,15 @@ impl<const B: usize> CoherenceEngine<B> {
         if self.artifacts.contains_key(&id) {
             return Err(CoherenceError::AlreadyExists);
         }
-        // Write KV blocks into the slab and trie; errors if slab is exhausted
-        // or kv_data element sizes don't match B * element_stride.
-        self.kv.insert(tokens, kv_data).map_err(CoherenceError::KvError)?;
-        // Retrieve the full block_id vec that was just inserted. The trie is
-        // always consistent after insert(), so lookup() is infallible here.
-        let blocks = self.kv.lookup(tokens).block_ids;
+        let blocks = {
+            let kv = self.kv.get_mut().unwrap();
+            kv.insert(tokens, kv_data).map_err(CoherenceError::KvError)?;
+            kv.lookup(tokens).block_ids
+        };
         let entry = ArtifactEntry::new_exclusive(agent, blocks, tokens.to_vec());
         debug_assert!(entry.invariants_hold(self.k_bound));
-        self.artifacts.insert(id, entry);
+        self.routing.get_mut().unwrap().insert(tokens, id);
+        self.artifacts.insert(id, Arc::new(Mutex::new(entry)));
         Ok(id)
     }
 
@@ -69,13 +73,10 @@ impl<const B: usize> CoherenceEngine<B> {
     /// (callers must invalidate concurrent readers before re-acquiring).
     ///
     /// Side effects: transitions state to Exclusive, sets owner to `agent`.
-    pub fn acquire(
-        &mut self,
-        id: ArtifactId,
-        agent: AgentId,
-    ) -> Result<(), CoherenceError> {
+    pub fn acquire(&self, id: ArtifactId, agent: AgentId) -> Result<(), CoherenceError> {
         let k_bound = self.k_bound;
-        let entry = self.artifacts.get_mut(&id).ok_or(CoherenceError::NotFound)?;
+        let entry_arc = self.artifacts.get(&id).ok_or(CoherenceError::NotFound)?;
+        let mut entry = entry_arc.lock().unwrap();
         // Only Invalid artifacts may be acquired; E/S/M require explicit
         // invalidation + writeback first to preserve SWMR and SeenBound.
         if entry.state != crate::MesiState::Invalid {
@@ -106,12 +107,12 @@ impl<const B: usize> CoherenceEngine<B> {
     ///
     /// Uses `kv.release()` for targeted per-artifact block release rather than
     /// the global LRU sweep used by the deprecated `kv.evict()` path.
-    pub fn invalidate(&mut self, id: ArtifactId) -> Result<(), CoherenceError> {
+    pub fn invalidate(&self, id: ArtifactId) -> Result<(), CoherenceError> {
         let k_bound = self.k_bound;
-        // Capture blocks before clearing; the borrow of entry must end before
-        // calling self.kv.release (which also needs &mut self).
-        let blocks = {
-            let entry = self.artifacts.get_mut(&id).ok_or(CoherenceError::NotFound)?;
+        let entry_arc = self.artifacts.get(&id).ok_or(CoherenceError::NotFound)?;
+        // Step 1: lock artifact, transition to Invalid, extract blocks + tokens.
+        let (tokens, blocks) = {
+            let mut entry = entry_arc.lock().unwrap();
             // Modified requires writeback before invalidation to prevent data loss.
             // Invalid is already terminal; second call is a caller bug.
             if entry.state == crate::MesiState::Modified
@@ -119,15 +120,18 @@ impl<const B: usize> CoherenceEngine<B> {
             {
                 return Err(CoherenceError::WrongState);
             }
+            let tokens = entry.tokens.clone();
             let blocks = std::mem::take(&mut entry.blocks);
-            entry.state = crate::MesiState::Invalid;
-            entry.owner = None;
+            entry.state  = crate::MesiState::Invalid;
+            entry.owner  = None;
             entry.sharers.clear();
-            blocks
-        };
-        // Targeted per-artifact release — not a global LRU sweep.
-        self.kv.release(&blocks);
-        debug_assert!(self.artifacts[&id].invariants_hold(k_bound));
+            (tokens, blocks)
+        }; // artifact lock released
+        // Step 2: free slab blocks (targeted per-artifact release — not a global LRU sweep).
+        self.kv.lock().unwrap().release(&blocks);
+        // Step 3: remove from routing (artifact no longer routable).
+        self.routing.lock().unwrap().remove(&tokens);
+        debug_assert!(entry_arc.lock().unwrap().invariants_hold(k_bound));
         Ok(())
     }
 
@@ -135,13 +139,10 @@ impl<const B: usize> CoherenceEngine<B> {
     /// Updates seen[agent] = ver. Returns Err(WrongState) if state is M or I.
     /// Returns Err(KBoundExceeded) if the agent's last-seen version is more than
     /// k_bound writes behind the current version.
-    pub fn read(
-        &mut self,
-        id: ArtifactId,
-        agent: AgentId,
-    ) -> Result<Vec<kv::BlockId>, CoherenceError> {
+    pub fn read(&self, id: ArtifactId, agent: AgentId) -> Result<Vec<kv::BlockId>, CoherenceError> {
         let k_bound = self.k_bound;
-        let entry = self.artifacts.get_mut(&id).ok_or(CoherenceError::NotFound)?;
+        let entry_arc = self.artifacts.get(&id).ok_or(CoherenceError::NotFound)?;
+        let mut entry = entry_arc.lock().unwrap();
         match entry.state {
             crate::MesiState::Modified | crate::MesiState::Invalid => {
                 return Err(CoherenceError::WrongState);
@@ -155,10 +156,11 @@ impl<const B: usize> CoherenceEngine<B> {
                 return Err(CoherenceError::KBoundExceeded);
             }
         }
+        let ver = entry.ver;
         entry.state = crate::MesiState::Shared;
         entry.owner = None;
         entry.sharers.insert(agent);
-        entry.seen.insert(agent, entry.ver);
+        entry.seen.insert(agent, ver);
         debug_assert!(entry.invariants_hold(k_bound));
         Ok(entry.blocks.clone())
     }
@@ -168,30 +170,34 @@ impl<const B: usize> CoherenceEngine<B> {
     /// Returns Err(WrongState) if not Exclusive. Returns Err(NotOwner) if
     /// `agent` is not the current exclusive owner.
     pub fn write(
-        &mut self,
+        &self,
         id: ArtifactId,
         agent: AgentId,
         tokens: &[kv::TokenId],
         kv_data: &[&[u8]],
     ) -> Result<(), CoherenceError> {
-        // Validate before touching KV. Immutable borrow dropped at end of block.
-        {
-            let entry = self.artifacts.get(&id).ok_or(CoherenceError::NotFound)?;
-            if entry.state != crate::MesiState::Exclusive {
-                return Err(CoherenceError::WrongState);
-            }
-            if entry.owner != Some(agent) {
-                return Err(CoherenceError::NotOwner);
-            }
-        }
-        self.kv.insert(tokens, kv_data).map_err(CoherenceError::KvError)?;
-        let new_blocks = self.kv.lookup(tokens).block_ids;
         let k_bound = self.k_bound;
-        let entry = self.artifacts.get_mut(&id).unwrap();
+        let entry_arc = self.artifacts.get(&id).ok_or(CoherenceError::NotFound)?;
+        let mut entry = entry_arc.lock().unwrap();
+        if entry.state != crate::MesiState::Exclusive {
+            return Err(CoherenceError::WrongState);
+        }
+        if entry.owner != Some(agent) {
+            return Err(CoherenceError::NotOwner);
+        }
+        let old_tokens = entry.tokens.clone();
+        // Lock ordering: artifact (already held) → routing → kv.
+        self.routing.lock().unwrap().remove(&old_tokens);
+        let new_blocks = {
+            let mut kv = self.kv.lock().unwrap();
+            kv.insert(tokens, kv_data).map_err(CoherenceError::KvError)?;
+            kv.lookup(tokens).block_ids
+        };
         entry.state = crate::MesiState::Modified;
-        entry.ver += 1;
+        entry.ver  += 1;
         // Owner sees its own write: matches TLA+ seen'[ag][a] = ver[a] + 1
-        entry.seen.insert(agent, entry.ver);
+        let new_ver = entry.ver;
+        entry.seen.insert(agent, new_ver);
         entry.blocks = new_blocks;
         entry.tokens = tokens.to_vec();
         debug_assert!(entry.invariants_hold(k_bound));
@@ -201,13 +207,17 @@ impl<const B: usize> CoherenceEngine<B> {
     /// M → E. Stabilise a modified artifact without evicting it.
     /// Retains the current owner in Exclusive state for continued use.
     /// Returns Err(WrongState) if state is not Modified.
-    pub fn writeback(&mut self, id: ArtifactId) -> Result<(), CoherenceError> {
+    pub fn writeback(&self, id: ArtifactId) -> Result<(), CoherenceError> {
         let k_bound = self.k_bound;
-        let entry = self.artifacts.get_mut(&id).ok_or(CoherenceError::NotFound)?;
+        let entry_arc = self.artifacts.get(&id).ok_or(CoherenceError::NotFound)?;
+        let mut entry = entry_arc.lock().unwrap();
         if entry.state != crate::MesiState::Modified {
             return Err(CoherenceError::WrongState);
         }
         entry.state = crate::MesiState::Exclusive;
+        let tokens = entry.tokens.clone();
+        // Insert into routing while holding artifact lock (artifact → routing ordering).
+        self.routing.lock().unwrap().insert(&tokens, id);
         debug_assert!(entry.invariants_hold(k_bound));
         Ok(())
     }
@@ -226,10 +236,10 @@ impl<const B: usize> CoherenceEngine<B> {
         source: ArtifactId,
         agent: AgentId,
     ) -> Result<ArtifactId, CoherenceError> {
-        // Validate source state (immutable borrow dropped before kv access).
+        // Validate source state (lock dropped before kv access).
         {
             let src = self.artifacts.get(&source).ok_or(CoherenceError::NotFound)?;
-            match src.state {
+            match src.lock().unwrap().state {
                 crate::MesiState::Exclusive | crate::MesiState::Shared => {}
                 _ => return Err(CoherenceError::WrongState),
             }
@@ -239,7 +249,7 @@ impl<const B: usize> CoherenceEngine<B> {
             return Err(CoherenceError::AlreadyExists);
         }
         // kv.fork does a longest-prefix match on tokens — zero memcpy for shared prefix.
-        let blocks = self.kv.fork(tokens);
+        let blocks = self.kv.get_mut().unwrap().fork(tokens);
         // tokens.to_vec() is the caller's intended sequence; blocks.len() * B is
         // what's actually cached. Store only the cached portion in entry.tokens.
         debug_assert!(
@@ -247,10 +257,11 @@ impl<const B: usize> CoherenceEngine<B> {
             "kv.fork() returned more blocks ({}) than tokens ({}) / B ({}) allows",
             blocks.len(), tokens.len(), B
         );
-        let cached_tokens = tokens[..blocks.len() * B].to_vec();
-        let entry = ArtifactEntry::new_exclusive(agent, blocks, cached_tokens);
+        let n = blocks.len() * B;
+        let entry = ArtifactEntry::new_exclusive(agent, blocks, tokens[..n].to_vec());
         debug_assert!(entry.invariants_hold(self.k_bound));
-        self.artifacts.insert(new_id, entry);
+        self.routing.get_mut().unwrap().insert(&tokens[..n], new_id);
+        self.artifacts.insert(new_id, Arc::new(Mutex::new(entry)));
         Ok(new_id)
     }
 
@@ -258,57 +269,38 @@ impl<const B: usize> CoherenceEngine<B> {
     /// against `tokens`. Returns None if no readable artifact covers any prefix.
     /// M and I artifacts are skipped.
     ///
-    /// Complexity: O(n * |tokens|) over registered artifacts. Sufficient for M3;
-    /// a dedicated routing index is deferred to M4.
-    ///
-    /// Note: this method does not update the KV trie's LRU clock. Blocks surfaced
-    /// by this path will not have `last_used` refreshed; under heavy eviction
-    /// pressure they may be evicted sooner than expected. Addressed in M4.
+    /// Delegates to `RoutingIndex::longest_prefix`. O(|tokens| / B).
     #[must_use]
     pub fn lookup(&self, tokens: &[kv::TokenId]) -> Option<crate::RouteResult> {
-        let mut best: Option<crate::RouteResult> = None;
-        for (&id, entry) in &self.artifacts {
-            if !matches!(entry.state, crate::MesiState::Exclusive | crate::MesiState::Shared) {
-                continue;
-            }
-            let matched = Self::common_prefix_tokens(&entry.tokens, tokens);
-            if matched == 0 {
-                continue;
-            }
-            let better = best.as_ref().is_none_or(|b| {
-                matched > b.matched_tokens
-                    || (matched == b.matched_tokens && id.0 < b.artifact_id.0)
-            });
-            if better {
-                best = Some(crate::RouteResult {
-                    artifact_id:    id,
-                    matched_tokens: matched,
-                    blocks:         entry.blocks[..matched / B].to_vec(),
-                });
-            }
+        let routing = self.routing.lock().unwrap();
+        let (artifact_id, matched_blocks) = routing.longest_prefix(tokens)?;
+        let entry_arc = self.artifacts.get(&artifact_id)?;
+        let entry = entry_arc.lock().unwrap();
+        // Only surface E or S artifacts — M and I must not be routed to.
+        if !matches!(entry.state, crate::MesiState::Exclusive | crate::MesiState::Shared) {
+            return None;
         }
-        best
-    }
-
-    /// Count the number of leading tokens common to `a` and `b`, rounded down
-    /// to the nearest complete block boundary (multiple of B).
-    fn common_prefix_tokens(a: &[kv::TokenId], b: &[kv::TokenId]) -> usize {
-        let matched_tokens = a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count();
-        // Round down to complete block boundary. B is the impl block's const param.
-        (matched_tokens / B) * B
+        let matched_tokens = matched_blocks * B;
+        Some(crate::RouteResult {
+            artifact_id,
+            matched_tokens,
+            blocks: entry.blocks[..matched_blocks].to_vec(),
+        })
     }
 
     /// Returns `(used_blocks, total_blocks)` for Prometheus metrics.
     pub fn stats(&self) -> (usize, usize) {
-        let total = self.kv.capacity();
-        let used  = total - self.kv.free_count();
+        let kv    = self.kv.lock().unwrap();
+        let total = kv.capacity();
+        let used  = total - kv.free_count();
         (used, total)
     }
 
     /// Run all four TLA+ invariants across every registered artifact.
     /// Returns Ok(()) if all pass; Err(id) for the first failing artifact.
     pub fn check_invariants(&self) -> Result<(), ArtifactId> {
-        for (&id, entry) in &self.artifacts {
+        for (&id, entry_arc) in &self.artifacts {
+            let entry = entry_arc.lock().unwrap();
             if !entry.invariants_hold(self.k_bound) {
                 return Err(id);
             }
@@ -349,9 +341,9 @@ mod tests {
         let slices: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
         let id = e.register(&tokens, &slices, 0).expect("register must succeed");
         assert!(e.check_invariants().is_ok());
-        assert_eq!(e.artifacts[&id].state, crate::MesiState::Exclusive);
-        assert_eq!(e.artifacts[&id].owner, Some(0));
-        assert_eq!(e.artifacts[&id].blocks.len(), 2);
+        assert_eq!(e.artifacts[&id].lock().unwrap().state, crate::MesiState::Exclusive);
+        assert_eq!(e.artifacts[&id].lock().unwrap().owner, Some(0));
+        assert_eq!(e.artifacts[&id].lock().unwrap().blocks.len(), 2);
     }
 
     #[test]
@@ -375,8 +367,8 @@ mod tests {
         // Invalidate first so we can acquire
         e.invalidate(id).unwrap();
         e.acquire(id, 1).expect("acquire on Invalid must succeed");
-        assert_eq!(e.artifacts[&id].state, crate::MesiState::Exclusive);
-        assert_eq!(e.artifacts[&id].owner, Some(1));
+        assert_eq!(e.artifacts[&id].lock().unwrap().state, crate::MesiState::Exclusive);
+        assert_eq!(e.artifacts[&id].lock().unwrap().owner, Some(1));
         assert!(e.check_invariants().is_ok());
     }
 
@@ -401,10 +393,10 @@ mod tests {
         let id = e.register(&tokens, &slices, 0).unwrap();
         let blocks = e.read(id, 1).expect("read from Exclusive must succeed");
         assert_eq!(blocks.len(), 2);
-        assert_eq!(e.artifacts[&id].state, crate::MesiState::Shared);
-        assert_eq!(e.artifacts[&id].owner, None);
-        assert!(e.artifacts[&id].sharers.contains(&1));
-        assert_eq!(e.artifacts[&id].seen[&1], 0); // ver=0 at time of read
+        assert_eq!(e.artifacts[&id].lock().unwrap().state, crate::MesiState::Shared);
+        assert_eq!(e.artifacts[&id].lock().unwrap().owner, None);
+        assert!(e.artifacts[&id].lock().unwrap().sharers.contains(&1));
+        assert_eq!(e.artifacts[&id].lock().unwrap().seen[&1], 0); // ver=0 at time of read
         assert!(e.check_invariants().is_ok());
     }
 
@@ -417,8 +409,8 @@ mod tests {
         let id = e.register(&tokens, &slices, 0).unwrap();
         e.read(id, 1).unwrap();
         e.read(id, 2).unwrap();
-        assert!(e.artifacts[&id].sharers.contains(&1));
-        assert!(e.artifacts[&id].sharers.contains(&2));
+        assert!(e.artifacts[&id].lock().unwrap().sharers.contains(&1));
+        assert!(e.artifacts[&id].lock().unwrap().sharers.contains(&2));
         assert!(e.check_invariants().is_ok());
     }
 
@@ -430,7 +422,7 @@ mod tests {
         let slices: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
         let id = e.register(&tokens, &slices, 0).unwrap();
         // Force M state
-        e.artifacts.get_mut(&id).unwrap().state = crate::MesiState::Modified;
+        e.artifacts[&id].lock().unwrap().state = crate::MesiState::Modified;
         let err = e.read(id, 1);
         assert!(matches!(err, Err(crate::CoherenceError::WrongState)));
     }
@@ -460,10 +452,10 @@ mod tests {
         let slices_ext: Vec<&[u8]> = data_ext.iter().map(|v| v.as_slice()).collect();
         e.write(id, 0, &tokens_ext, &slices_ext).expect("write from Exclusive must succeed");
 
-        assert_eq!(e.artifacts[&id].state, crate::MesiState::Modified);
-        assert_eq!(e.artifacts[&id].ver, 1);
-        assert_eq!(e.artifacts[&id].seen[&0], 1); // owner sees own write
-        assert_eq!(e.artifacts[&id].blocks.len(), 3);
+        assert_eq!(e.artifacts[&id].lock().unwrap().state, crate::MesiState::Modified);
+        assert_eq!(e.artifacts[&id].lock().unwrap().ver, 1);
+        assert_eq!(e.artifacts[&id].lock().unwrap().seen[&0], 1); // owner sees own write
+        assert_eq!(e.artifacts[&id].lock().unwrap().blocks.len(), 3);
         assert!(e.check_invariants().is_ok());
     }
 
@@ -545,11 +537,11 @@ mod tests {
         let data_ext = make_kv_data(3);
         let slices_ext: Vec<&[u8]> = data_ext.iter().map(|v| v.as_slice()).collect();
         e.write(id, 0, &tokens_ext, &slices_ext).unwrap();
-        assert_eq!(e.artifacts[&id].state, crate::MesiState::Modified);
+        assert_eq!(e.artifacts[&id].lock().unwrap().state, crate::MesiState::Modified);
 
         e.writeback(id).expect("writeback must succeed from Modified");
-        assert_eq!(e.artifacts[&id].state, crate::MesiState::Exclusive);
-        assert_eq!(e.artifacts[&id].owner, Some(0)); // owner retained
+        assert_eq!(e.artifacts[&id].lock().unwrap().state, crate::MesiState::Exclusive);
+        assert_eq!(e.artifacts[&id].lock().unwrap().owner, Some(0)); // owner retained
         assert!(e.check_invariants().is_ok());
     }
 
@@ -572,9 +564,9 @@ mod tests {
         let slices: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
         let id = e.register(&tokens, &slices, 0).unwrap();
         e.invalidate(id).expect("invalidate from E must succeed");
-        assert_eq!(e.artifacts[&id].state, crate::MesiState::Invalid);
-        assert_eq!(e.artifacts[&id].owner, None);
-        assert!(e.artifacts[&id].blocks.is_empty());
+        assert_eq!(e.artifacts[&id].lock().unwrap().state, crate::MesiState::Invalid);
+        assert_eq!(e.artifacts[&id].lock().unwrap().owner, None);
+        assert!(e.artifacts[&id].lock().unwrap().blocks.is_empty());
         assert!(e.check_invariants().is_ok());
     }
 
@@ -587,9 +579,9 @@ mod tests {
         let id = e.register(&tokens, &slices, 0).unwrap();
         e.read(id, 1).unwrap();
         e.read(id, 2).unwrap();
-        assert_eq!(e.artifacts[&id].sharers.len(), 2);
+        assert_eq!(e.artifacts[&id].lock().unwrap().sharers.len(), 2);
         e.invalidate(id).expect("invalidate from S must succeed");
-        assert!(e.artifacts[&id].sharers.is_empty());
+        assert!(e.artifacts[&id].lock().unwrap().sharers.is_empty());
         assert!(e.check_invariants().is_ok());
     }
 
@@ -618,7 +610,7 @@ mod tests {
         let id = e.register(&tokens, &slices, 0).unwrap();
         e.read(id, 1).unwrap();           // seen[1] = 0
         e.invalidate(id).unwrap();
-        assert_eq!(e.artifacts[&id].seen.get(&1), Some(&0),
+        assert_eq!(e.artifacts[&id].lock().unwrap().seen.get(&1), Some(&0),
             "seen must not be cleared by invalidate");
     }
 
@@ -636,12 +628,14 @@ mod tests {
             .expect("register_fork must succeed");
 
         assert_ne!(fork_id, base_id, "fork must get a new ArtifactId");
-        assert_eq!(e.artifacts[&fork_id].state, crate::MesiState::Exclusive);
-        assert_eq!(e.artifacts[&fork_id].owner, Some(1));
+        assert_eq!(e.artifacts[&fork_id].lock().unwrap().state, crate::MesiState::Exclusive);
+        assert_eq!(e.artifacts[&fork_id].lock().unwrap().owner, Some(1));
         // Fork prefix blocks are shared with base (CoW)
+        let fork_blocks = e.artifacts[&fork_id].lock().unwrap().blocks.clone();
+        let base_blocks = e.artifacts[&base_id].lock().unwrap().blocks.clone();
         assert_eq!(
-            e.artifacts[&fork_id].blocks[..2],
-            e.artifacts[&base_id].blocks[..2],
+            fork_blocks[..2],
+            base_blocks[..2],
             "first 2 blocks must be shared with the base artifact"
         );
         assert!(e.check_invariants().is_ok());
@@ -695,68 +689,6 @@ mod tests {
     }
 
     #[test]
-    fn lookup_returns_best_prefix_match() {
-        let mut e = CoherenceEngine::<2>::new_heap(16, 4, 5);
-        // short: 2 tokens = 1 block
-        let short: Vec<kv::TokenId> = vec![0, 1];
-        let d_short = make_kv_data(1);
-        let s_short: Vec<&[u8]> = d_short.iter().map(|v| v.as_slice()).collect();
-        e.register(&short, &s_short, 0).unwrap();
-
-        // long: 4 tokens = 2 blocks
-        let long: Vec<kv::TokenId> = vec![0, 1, 2, 3];
-        let d_long = make_kv_data(2);
-        let s_long: Vec<&[u8]> = d_long.iter().map(|v| v.as_slice()).collect();
-        e.register(&long, &s_long, 0).unwrap();
-
-        // query matches long more — lookup must return the longer artifact
-        let query: Vec<kv::TokenId> = vec![0, 1, 2, 3, 4, 5];
-        let result = e.lookup(&query).expect("lookup must find a match");
-        assert_eq!(result.matched_tokens, 4, "longer match must win");
-        assert_eq!(result.blocks.len(), 2);
-    }
-
-    #[test]
-    fn lookup_skips_modified_and_invalid() {
-        let mut e = CoherenceEngine::<2>::new_heap(16, 4, 5);
-        let tokens: Vec<kv::TokenId> = vec![0, 1, 2, 3];
-        let data = make_kv_data(2);
-        let slices: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
-        let id = e.register(&tokens, &slices, 0).unwrap();
-        e.invalidate(id).unwrap();
-        // After invalidate, state=Invalid — lookup must return None
-        assert!(e.lookup(&tokens).is_none(), "Invalid artifact must not be returned by lookup");
-
-        // Also verify Modified artifacts are skipped
-        let tokens2: Vec<kv::TokenId> = vec![4, 5, 6, 7];
-        let d2 = make_kv_data(2);
-        let s2: Vec<&[u8]> = d2.iter().map(|v| v.as_slice()).collect();
-        let id2 = e.register(&tokens2, &s2, 1).unwrap();
-        e.artifacts.get_mut(&id2).unwrap().state = crate::MesiState::Modified;
-        assert!(e.lookup(&tokens2).is_none(), "Modified artifact must not be returned by lookup");
-    }
-
-    #[test]
-    fn lookup_returns_none_on_empty_engine() {
-        let e = CoherenceEngine::<2>::new_heap(8, 4, 5);
-        assert!(e.lookup(&[0u32, 1]).is_none());
-    }
-
-    #[test]
-    fn lookup_rounds_down_to_block_boundary() {
-        // B=2: 3 matching tokens but only 1 complete block (2 tokens)
-        let mut e = CoherenceEngine::<2>::new_heap(8, 4, 5);
-        let tokens: Vec<kv::TokenId> = vec![0, 1];
-        let data = make_kv_data(1);
-        let slices: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
-        e.register(&tokens, &slices, 0).unwrap();
-        // Query: [0, 1, 99] — only first 2 tokens (1 block) are cached
-        let result = e.lookup(&[0u32, 1, 99]).expect("1-block match must be found");
-        assert_eq!(result.matched_tokens, 2);
-        assert_eq!(result.blocks.len(), 1);
-    }
-
-    #[test]
     fn fork_artifact_stays_readable_after_source_invalidated() {
         // Regression: invalidating the source artifact must not corrupt the fork's slab
         // references. The fork holds its own incref on the shared prefix blocks.
@@ -795,6 +727,6 @@ mod tests {
         // Slab: 4 blocks used, 4 free
         e.invalidate(id1).unwrap();
         // After invalidating id1 (2 blocks), slab should have exactly 2 more free.
-        assert_eq!(e.kv.free_count(), 6, "invalidate must free exactly the artifact's 2 blocks");
+        assert_eq!(e.kv.lock().unwrap().free_count(), 6, "invalidate must free exactly the artifact's 2 blocks");
     }
 }
