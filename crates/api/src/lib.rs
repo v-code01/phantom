@@ -54,6 +54,9 @@ impl From<scheduler::SchedulerError> for ApiError {
             SchedulerError::Coherence(CoherenceError::KvError(CacheError::OutOfBlocks)) => {
                 ApiError::OutOfBlocks
             }
+            SchedulerError::Coherence(CoherenceError::KvError(CacheError::DataSizeMismatch)) => {
+                ApiError::BadRequest("kv_data block size mismatch".into())
+            }
             _ => ApiError::Internal,
         }
     }
@@ -79,18 +82,17 @@ async fn serve_handler<const B: usize>(
             format!("tokens.len() must be a non-zero multiple of {B}")
         ));
     }
-    if !req.kv_data.is_empty() && req.kv_data.len() % n_blocks != 0 {
+    if req.kv_data.is_empty() {
+        return Err(ApiError::BadRequest("kv_data must not be empty".into()));
+    }
+    if req.kv_data.len() % n_blocks != 0 {
         return Err(ApiError::BadRequest(
             "kv_data.len() must be divisible by n_blocks".into()
         ));
     }
 
-    let block_bytes = if req.kv_data.is_empty() { 0 } else { req.kv_data.len() / n_blocks };
-    let kv_data: Vec<Vec<u8>> = if block_bytes == 0 {
-        vec![vec![]; n_blocks]
-    } else {
-        req.kv_data.chunks(block_bytes).map(|c| c.to_vec()).collect()
-    };
+    let block_bytes = req.kv_data.len() / n_blocks;
+    let kv_data: Vec<Vec<u8>> = req.kv_data.chunks(block_bytes).map(|c| c.to_vec()).collect();
 
     let sched_req = SchedulerRequest {
         tokens:  req.tokens,
@@ -99,11 +101,14 @@ async fn serve_handler<const B: usize>(
     };
 
     let scheduler = state.scheduler.clone();
-    let t0 = std::time::Instant::now();
-    let result = tokio::task::spawn_blocking(move || scheduler.handle(&sched_req))
-        .await
-        .map_err(|_| ApiError::Internal)?;
-    let latency_ns = t0.elapsed().as_nanos() as u64;
+    let result = tokio::task::spawn_blocking(move || {
+        let t0 = std::time::Instant::now();
+        let r = scheduler.handle(&sched_req);
+        (r, t0.elapsed().as_nanos() as u64)
+    })
+    .await
+    .map_err(|_| ApiError::Internal)?;
+    let (result, latency_ns) = result;
 
     let r = result.map_err(ApiError::from)?;
 
@@ -267,6 +272,31 @@ mod tests {
             .oneshot(serve_body((100u32..132).collect(), 0, kv_data))
             .await.unwrap();
         assert_eq!(r2.status(), StatusCode::INSUFFICIENT_STORAGE, "full slab must return 507");
+    }
+
+    #[tokio::test]
+    async fn bad_token_count_returns_400() {
+        let app = build_test_app(64);
+        // 31 tokens — not divisible by B=16
+        let kv_data: Vec<u8> = vec![1u8; 2 * TEST_B * TEST_STRIDE];
+        let resp = app
+            .oneshot(serve_body((0u32..31).collect(), 0, kv_data))
+            .await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn latency_ns_is_positive() {
+        let app = build_test_app(64);
+        let tokens:  Vec<u32> = (0u32..32).collect();
+        let kv_data: Vec<u8>  = vec![1u8; 2 * TEST_B * TEST_STRIDE];
+
+        // Cold miss
+        let r1 = app
+            .oneshot(serve_body(tokens, 0, kv_data))
+            .await.unwrap();
+        let b1 = parse_serve_response(r1).await;
+        assert!(b1.latency_ns > 0, "latency_ns must be non-zero");
     }
 
     #[tokio::test]
