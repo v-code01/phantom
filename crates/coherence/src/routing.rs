@@ -1,3 +1,6 @@
+// Dead-code allowed until Task 2 wires RoutingIndex into CoherenceEngine.
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 use xxhash_rust::xxh3::xxh3_64;
 use kv::TokenId;
@@ -19,8 +22,9 @@ impl<const B: usize> RoutingIndex<B> {
     }
 
     fn hash_block(tokens: &[TokenId]) -> u64 {
-        // SAFETY: TokenId is u32 — no interior padding; all bytes are value bytes.
-        // Native-endian, consistent within a single PHANTOM process.
+        // SAFETY: TokenId is u32 — repr(transparent) u32, no interior padding.
+        // Reinterpretation as &[u8] is valid in native-endian context (intra-process only).
+        // This matches the same pattern used in ArtifactId::from_tokens (lib.rs).
         let bytes = unsafe {
             std::slice::from_raw_parts(
                 tokens.as_ptr() as *const u8,
@@ -52,7 +56,9 @@ impl<const B: usize> RoutingIndex<B> {
     }
 
     pub(crate) fn remove(&mut self, tokens: &[TokenId]) {
-        if tokens.len() % B != 0 || tokens.is_empty() { return; }
+        if tokens.is_empty() { return; }
+        debug_assert_eq!(tokens.len() % B, 0, "tokens.len() must be multiple of B={B}");
+        if tokens.len() % B != 0 { return; }
         Self::remove_from(&mut self.root, tokens);
     }
 
@@ -63,6 +69,8 @@ impl<const B: usize> RoutingIndex<B> {
         if let Some(node) = map.get_mut(&key) {
             if rest.is_empty() {
                 node.artifact_id = None;
+                // Empty nodes are not pruned — they're harmless (longest_prefix skips them)
+                // and avoiding recursion-on-return simplifies lock safety in Task 2+.
             } else {
                 Self::remove_from(&mut node.children, rest);
             }
