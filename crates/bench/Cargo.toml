@@ -16,3 +16,7 @@ proptest   = { workspace = true }
 [[bench]]
 name    = "serving"
 harness = false
+
+[[bench]]
+name    = "coherence"
+harness = false
