@@ -272,19 +272,23 @@ impl<const B: usize> CoherenceEngine<B> {
     /// Delegates to `RoutingIndex::longest_prefix`. O(|tokens| / B).
     #[must_use]
     pub fn lookup(&self, tokens: &[kv::TokenId]) -> Option<crate::RouteResult> {
-        let routing = self.routing.lock().unwrap();
-        let (artifact_id, matched_blocks) = routing.longest_prefix(tokens)?;
+        // Step 1: O(k) routing lookup — routing Mutex acquired then released.
+        let (artifact_id, matched_blocks) = {
+            let routing = self.routing.lock().unwrap();
+            routing.longest_prefix(tokens)
+        }?;
+        // routing Mutex released before acquiring the per-artifact Mutex (lock-ordering: artifact first).
+        // Step 2: read blocks from the per-artifact entry.
         let entry_arc = self.artifacts.get(&artifact_id)?;
         let entry = entry_arc.lock().unwrap();
-        // Only surface E or S artifacts — M and I must not be routed to.
         if !matches!(entry.state, crate::MesiState::Exclusive | crate::MesiState::Shared) {
             return None;
         }
-        let matched_tokens = matched_blocks * B;
+        let blocks = entry.blocks[..matched_blocks].to_vec();
         Some(crate::RouteResult {
             artifact_id,
-            matched_tokens,
-            blocks: entry.blocks[..matched_blocks].to_vec(),
+            matched_tokens: matched_blocks * B,
+            blocks,
         })
     }
 
