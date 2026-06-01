@@ -1,22 +1,19 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use kv::TokenId;
-use crate::{AgentId, ArtifactId, CoherenceError, RouteResult, engine::CoherenceEngine};
+use crate::{AgentId, ArtifactId, CoherenceError, MesiState, RouteResult, engine::CoherenceEngine};
 
-/// Thread-safe wrapper over [`CoherenceEngine`]. Backed by an `Arc<Mutex<...>>`
-/// so clones are cheap (reference-count bump) and all share the same engine state.
+/// Thread-safe wrapper over [`CoherenceEngine`]. Backed by `Arc<RwLock<...>>` so clones
+/// are cheap and concurrent hot-path reads of distinct artifacts run in parallel.
 ///
-/// All methods acquire the inner `Mutex` for the duration of the call — callers
-/// should not hold results across calls that themselves lock (e.g., do not call
-/// `lookup` and then `read` while holding the lookup result under a separate lock).
+/// # Lock policy
+/// - `register`, `register_fork` → exclusive Write lock (structural HashMap change)
+/// - All other methods → shared Read lock + inner per-artifact Mutex
 ///
 /// # Invariants
-/// - `Clone` is an `Arc` clone: O(1), no deep copy.
-/// - Mutex poisoning propagates as `unwrap()` panics — acceptable because poison
-///   implies an engine panic in a prior call, which is already a fatal state.
-/// - This type is the **only** route into `CoherenceEngine` from Router and
-///   Scheduler. Neither component ever holds or names the inner `Mutex`.
+/// - Clone is O(1): Arc bump, no deep copy.
+/// - RwLock poisoning propagates as `unwrap()` panics — fatal, coherence state unrecoverable.
 #[derive(Clone)]
-pub struct SyncEngine<const B: usize>(Arc<Mutex<CoherenceEngine<B>>>);
+pub struct SyncEngine<const B: usize>(Arc<RwLock<CoherenceEngine<B>>>);
 
 impl<const B: usize> SyncEngine<B> {
     /// Construct a `SyncEngine` backed by a GPU-resident Metal buffer.
@@ -32,7 +29,7 @@ impl<const B: usize> SyncEngine<B> {
         element_stride: usize,
         k_bound: u64,
     ) -> Self {
-        Self(Arc::new(Mutex::new(
+        Self(Arc::new(RwLock::new(
             CoherenceEngine::new(device, capacity, element_stride, k_bound),
         )))
     }
@@ -47,32 +44,50 @@ impl<const B: usize> SyncEngine<B> {
     /// * `element_stride` — byte size of a single KV element within a block.
     /// * `k_bound`        — maximum staleness (in writer versions) tolerated per agent.
     pub fn new_heap(capacity: usize, element_stride: usize, k_bound: u64) -> Self {
-        Self(Arc::new(Mutex::new(
+        Self(Arc::new(RwLock::new(
             CoherenceEngine::new_heap(capacity, element_stride, k_bound),
         )))
     }
 
-    /// Find the artifact in E or S state with the longest token prefix matching
-    /// `tokens`. Returns `None` if no readable artifact covers any prefix.
+    /// Find the artifact with the longest token prefix match against `tokens`.
+    /// Returns `None` if no readable (E or S) artifact covers any prefix.
     ///
-    /// Complexity: O(n * |tokens|) over registered artifacts — same as the
-    /// underlying `CoherenceEngine::lookup`.
+    /// Hot path: holds only the outer Read lock. Two-step under Read lock:
+    ///   1. routing Mutex (O(k) trie walk) — released before step 2.
+    ///   2. per-artifact Mutex — checks state, reads blocks.
+    /// Different artifacts are fully concurrent under this path.
     #[must_use]
     pub fn lookup(&self, tokens: &[TokenId]) -> Option<RouteResult> {
-        self.0.lock().unwrap().lookup(tokens)
+        let engine = self.0.read().unwrap();
+        // Step 1: O(k) routing lookup — routing Mutex acquired then released.
+        let (artifact_id, matched_blocks) = {
+            let routing = engine.routing.lock().unwrap();
+            routing.longest_prefix(tokens)
+        }?;
+        // Step 2: read blocks from artifact — per-artifact Mutex acquired then released.
+        // routing Mutex is released (dropped above) before artifact Mutex acquired.
+        let entry_arc = engine.artifacts.get(&artifact_id)?;
+        let entry = entry_arc.lock().unwrap();
+        if !matches!(entry.state, MesiState::Exclusive | MesiState::Shared) {
+            return None; // concurrent invalidation between steps 1 and 2
+        }
+        let blocks = entry.blocks[..matched_blocks].to_vec();
+        Some(RouteResult { artifact_id, matched_tokens: matched_blocks * B, blocks })
     }
 
     /// Register a new artifact from raw KV data.
     ///
     /// Returns `Err(AlreadyExists)` if an artifact with the same token hash is
     /// already registered. Propagates KV slab errors as `Err(KvError(_))`.
+    ///
+    /// Write lock: structural insertion into `artifacts` HashMap.
     pub fn register(
         &self,
         tokens: &[TokenId],
         kv_data: &[&[u8]],
         agent: AgentId,
     ) -> Result<ArtifactId, CoherenceError> {
-        self.0.lock().unwrap().register(tokens, kv_data, agent)
+        self.0.write().unwrap().register(tokens, kv_data, agent)
     }
 
     /// Create a new artifact by CoW-forking an existing one.
@@ -81,16 +96,14 @@ impl<const B: usize> SyncEngine<B> {
     /// starts in `Exclusive` state owned by `agent`. Prefix blocks are shared
     /// zero-copy via the underlying KV slab.
     ///
-    /// Returns `Err(NotFound)` if `source` is not registered.
-    /// Returns `Err(WrongState)` if `source` is `Modified` or `Invalid`.
-    /// Returns `Err(AlreadyExists)` if `tokens` hash to an already-registered id.
+    /// Write lock: structural insertion into `artifacts` HashMap.
     pub fn register_fork(
         &self,
         tokens: &[TokenId],
         source: ArtifactId,
         agent: AgentId,
     ) -> Result<ArtifactId, CoherenceError> {
-        self.0.lock().unwrap().register_fork(tokens, source, agent)
+        self.0.write().unwrap().register_fork(tokens, source, agent)
     }
 
     /// I → E. Re-claim an invalidated artifact for exclusive write access.
@@ -98,7 +111,7 @@ impl<const B: usize> SyncEngine<B> {
     /// Returns `Err(NotFound)` if `id` is not registered.
     /// Returns `Err(WrongState)` if the artifact is not in `Invalid` state.
     pub fn acquire(&self, id: ArtifactId, agent: AgentId) -> Result<(), CoherenceError> {
-        self.0.lock().unwrap().acquire(id, agent)
+        self.0.read().unwrap().acquire(id, agent)
     }
 
     /// E/S → S. Add `agent` to the sharer set and return the backing block ids.
@@ -107,7 +120,7 @@ impl<const B: usize> SyncEngine<B> {
     /// Returns `Err(KBoundExceeded)` if the agent's last-seen version is more
     /// than `k_bound` writes behind the current version.
     pub fn read(&self, id: ArtifactId, agent: AgentId) -> Result<Vec<kv::BlockId>, CoherenceError> {
-        self.0.lock().unwrap().read(id, agent)
+        self.0.read().unwrap().read(id, agent)
     }
 
     /// E → M. The exclusive owner writes new KV data extending `tokens`.
@@ -121,14 +134,14 @@ impl<const B: usize> SyncEngine<B> {
         tokens: &[TokenId],
         kv_data: &[&[u8]],
     ) -> Result<(), CoherenceError> {
-        self.0.lock().unwrap().write(id, agent, tokens, kv_data)
+        self.0.read().unwrap().write(id, agent, tokens, kv_data)
     }
 
     /// M → E. Stabilise a modified artifact, retaining the current owner.
     ///
     /// Returns `Err(WrongState)` if state is not `Modified`.
     pub fn writeback(&self, id: ArtifactId) -> Result<(), CoherenceError> {
-        self.0.lock().unwrap().writeback(id)
+        self.0.read().unwrap().writeback(id)
     }
 
     /// E/S → I. Invalidate an artifact, releasing its KV blocks back to the slab.
@@ -136,7 +149,7 @@ impl<const B: usize> SyncEngine<B> {
     /// Returns `Err(WrongState)` if state is `Modified` (must writeback first) or
     /// already `Invalid` (double-invalidate is a caller bug).
     pub fn invalidate(&self, id: ArtifactId) -> Result<(), CoherenceError> {
-        self.0.lock().unwrap().invalidate(id)
+        self.0.read().unwrap().invalidate(id)
     }
 
     /// Run all four TLA+ invariants across every registered artifact.
@@ -144,12 +157,12 @@ impl<const B: usize> SyncEngine<B> {
     /// Returns `Ok(())` if all pass; `Err(id)` for the first failing artifact.
     /// Intended for use in tests and debug assertions.
     pub fn check_invariants(&self) -> Result<(), ArtifactId> {
-        self.0.lock().unwrap().check_invariants()
+        self.0.read().unwrap().check_invariants()
     }
 
     /// Returns `(used_blocks, total_blocks)`. Intended for Prometheus metrics.
     pub fn stats(&self) -> (usize, usize) {
-        self.0.lock().unwrap().stats()
+        self.0.read().unwrap().stats()
     }
 }
 
@@ -221,6 +234,19 @@ mod tests {
         let b2 = t2.join().unwrap();
         assert_eq!(b1, b2, "concurrent readers must see same blocks");
         engine.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn sync_engine_lookup_uses_routing_index() {
+        let engine = SyncEngine::<2>::new_heap(8, 4, 5);
+        let tokens: Vec<TokenId> = vec![0, 1, 2, 3];
+        let data: Vec<Vec<u8>> = (0..2).map(|i| vec![i as u8; 8]).collect();
+        let slices: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+        let id = engine.register(&tokens, &slices, 0).unwrap();
+        let result = engine.lookup(&tokens).expect("lookup must find registered artifact");
+        assert_eq!(result.artifact_id, id);
+        assert_eq!(result.matched_tokens, 4);
+        assert_eq!(result.blocks.len(), 2);
     }
 
     #[test]
