@@ -111,6 +111,7 @@ impl<const B: usize> SyncEngine<B> {
     /// Returns `Err(NotFound)` if `id` is not registered.
     /// Returns `Err(WrongState)` if the artifact is not in `Invalid` state.
     pub fn acquire(&self, id: ArtifactId, agent: AgentId) -> Result<(), CoherenceError> {
+        // Read lock: state mutation is serialized by the per-artifact Mutex inside.
         self.0.read().unwrap().acquire(id, agent)
     }
 
@@ -134,6 +135,8 @@ impl<const B: usize> SyncEngine<B> {
         tokens: &[TokenId],
         kv_data: &[&[u8]],
     ) -> Result<(), CoherenceError> {
+        // Read lock is correct: CoherenceEngine::write takes &self and serializes
+        // all mutation via per-artifact + routing + kv Mutexes internally.
         self.0.read().unwrap().write(id, agent, tokens, kv_data)
     }
 
