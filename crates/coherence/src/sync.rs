@@ -146,6 +146,11 @@ impl<const B: usize> SyncEngine<B> {
     pub fn check_invariants(&self) -> Result<(), ArtifactId> {
         self.0.lock().unwrap().check_invariants()
     }
+
+    /// Returns `(used_blocks, total_blocks)`. Intended for Prometheus metrics.
+    pub fn stats(&self) -> (usize, usize) {
+        self.0.lock().unwrap().stats()
+    }
 }
 
 #[cfg(test)]
@@ -160,6 +165,23 @@ mod tests {
     #[test]
     fn sync_engine_constructs_heap() {
         let _e = SyncEngine::<2>::new_heap(8, 4, 5);
+    }
+
+    #[test]
+    fn stats_reflects_allocation() {
+        let engine = SyncEngine::<2>::new_heap(8, 4, 5);
+        let (used0, total0) = engine.stats();
+        assert_eq!(used0, 0, "fresh engine has 0 used blocks");
+        assert_eq!(total0, 8, "total must equal capacity");
+
+        let tokens: Vec<TokenId> = vec![0, 1, 2, 3]; // B=2 → 2 blocks
+        let data: Vec<Vec<u8>> = (0..2).map(|i| vec![i as u8; 8]).collect();
+        let slices: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+        engine.register(&tokens, &slices, 0).unwrap();
+
+        let (used1, total1) = engine.stats();
+        assert_eq!(used1, 2, "2-block artifact must consume 2 blocks");
+        assert_eq!(total1, 8);
     }
 
     #[test]

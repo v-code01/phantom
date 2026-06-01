@@ -127,6 +127,10 @@ impl<const B: usize> KvCache<B> {
     pub fn free_count(&self) -> usize {
         self.slab.free_count()
     }
+
+    pub fn capacity(&self) -> usize {
+        self.slab.capacity
+    }
 }
 
 // SAFETY: BlockSlab<B>: Sync (above). DualRadixTrie fields are Vec and HashMap

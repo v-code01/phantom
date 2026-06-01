@@ -46,6 +46,11 @@ impl<const B: usize> Scheduler<B> {
         self.engine.check_invariants()
     }
 
+    /// Returns `(used_blocks, total_blocks)` from the underlying slab.
+    pub fn stats(&self) -> (usize, usize) {
+        self.engine.stats()
+    }
+
     /// Route a request through the cache and return the artifact ID and block list.
     ///
     /// After a successful cold-miss registration, the artifact is left in Shared state.
@@ -187,5 +192,19 @@ mod tests {
         let req2 = make_request(vec![0, 1, 2, 3], 1);
         let resp2 = sched.handle(&req2).unwrap();
         assert!(resp2.cache_hit, "second call with same tokens must be a cache hit");
+    }
+
+    #[test]
+    fn stats_returns_used_and_total() {
+        let engine = coherence::SyncEngine::<2>::new_heap(32, 4, 5);
+        let sched = Scheduler::new(engine);
+        let (used, total) = sched.stats();
+        assert_eq!(used, 0);
+        assert_eq!(total, 32);
+
+        let req = make_request(vec![0, 1, 2, 3], 0); // B=2 → 2 blocks
+        sched.handle(&req).unwrap();
+        let (used2, _) = sched.stats();
+        assert_eq!(used2, 2);
     }
 }

@@ -298,6 +298,13 @@ impl<const B: usize> CoherenceEngine<B> {
         (matched_tokens / B) * B
     }
 
+    /// Returns `(used_blocks, total_blocks)` for Prometheus metrics.
+    pub fn stats(&self) -> (usize, usize) {
+        let total = self.kv.capacity();
+        let used  = total - self.kv.free_count();
+        (used, total)
+    }
+
     /// Run all four TLA+ invariants across every registered artifact.
     /// Returns Ok(()) if all pass; Err(id) for the first failing artifact.
     pub fn check_invariants(&self) -> Result<(), ArtifactId> {
