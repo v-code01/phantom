@@ -124,6 +124,11 @@ impl<const B: usize> BlockSlab<B> {
         self.free_list.len()
     }
 
+    /// Returns the total number of blocks in this slab.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     /// Write `B * element_stride` bytes from `src` into block `id`, then set
     /// the I5 committed flag with a SeqCst store so any subsequent reader
     /// that loads `committed == true` is guaranteed to see all written bytes.

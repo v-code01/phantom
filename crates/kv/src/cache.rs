@@ -128,8 +128,9 @@ impl<const B: usize> KvCache<B> {
         self.slab.free_count()
     }
 
+    /// Returns the total number of KV blocks in this cache.
     pub fn capacity(&self) -> usize {
-        self.slab.capacity
+        self.slab.capacity()
     }
 }
 
