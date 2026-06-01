@@ -270,4 +270,46 @@ mod tests {
         assert_eq!(base_blocks, fork_blocks, "fork must share prefix blocks with base");
         engine.check_invariants().unwrap();
     }
+
+    #[test]
+    fn concurrent_reads_different_artifacts_complete_without_deadlock() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        const N: usize = 8;
+
+        // B=2, element_stride=4: each block is 8 bytes. N artifacts × 2 blocks each.
+        let engine = SyncEngine::<2>::new_heap(N * 4, 4, 100);
+
+        // Register N artifacts with non-overlapping token sequences.
+        let mut ids = Vec::new();
+        for i in 0..N {
+            let base    = (i * 4) as u32;
+            let tokens: Vec<TokenId>  = (base..base + 4).collect(); // 2 blocks of B=2
+            let data:   Vec<Vec<u8>>  = (0..2).map(|j| vec![(i + j) as u8; 8]).collect();
+            let slices: Vec<&[u8]>    = data.iter().map(|v| v.as_slice()).collect();
+            let id = engine.register(&tokens, &slices, 0).unwrap();
+            engine.read(id, 0).unwrap(); // transition to Shared so multiple readers can join
+            ids.push(id);
+        }
+
+        let barrier = Arc::new(Barrier::new(N));
+        let mut handles = Vec::new();
+
+        for (i, &id) in ids.iter().enumerate() {
+            let e = engine.clone();
+            let b = barrier.clone();
+            handles.push(thread::spawn(move || {
+                b.wait(); // all N threads start simultaneously
+                e.read(id, i + 1).expect("concurrent read must succeed")
+            }));
+        }
+
+        for handle in handles {
+            let blocks = handle.join().expect("thread must not panic");
+            assert!(!blocks.is_empty(), "read must return non-empty block list");
+        }
+
+        engine.check_invariants().expect("invariants must hold after concurrent reads");
+    }
 }
