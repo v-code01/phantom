@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::time::{Duration, Instant};
 
 use coherence::SyncEngine;
@@ -53,7 +54,63 @@ fn bench_scheduler_cache_hit(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_scheduler_cold_miss(_c: &mut Criterion) {}
+fn bench_scheduler_cold_miss(c: &mut Criterion) {
+    let kv_data = make_kv_data(2);
+
+    let mut group = c.benchmark_group("scheduler_cold_miss");
+
+    // --- heap variant ---
+    // Capacity 16384 blocks = 8192 unique 2-block artifacts; sufficient for all
+    // Criterion warm-up + measurement iterations combined.
+    {
+        let engine = SyncEngine::<B>::new_heap(16_384, STRIDE, 100);
+        let sched = Scheduler::new(engine);
+        // Cell<u64> for interior mutability across nested FnMut closures (no Sync needed).
+        let counter = Cell::new(0u64);
+        group.bench_function("heap", |b| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    let i = counter.get();
+                    counter.set(i + 1);
+                    // Allocate tokens + req outside the timed window
+                    let tokens: Vec<u32> = (i * 32..(i + 1) * 32).map(|x| x as u32).collect();
+                    let req = Request { tokens, kv_data: kv_data.clone(), agent: 0 };
+                    let t0 = Instant::now();
+                    black_box(sched.handle(&req)).unwrap();
+                    total += t0.elapsed();
+                }
+                total
+            });
+        });
+    }
+
+    // --- metal variant ---
+    {
+        let device = metal::Device::system_default()
+            .expect("no Metal device — PHANTOM benchmarks require Apple Silicon");
+        let engine = SyncEngine::<B>::new(&device, 16_384, STRIDE, 100);
+        let sched = Scheduler::new(engine);
+        let counter = Cell::new(0u64);
+        group.bench_function("metal", |b| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    let i = counter.get();
+                    counter.set(i + 1);
+                    let tokens: Vec<u32> = (i * 32..(i + 1) * 32).map(|x| x as u32).collect();
+                    let req = Request { tokens, kv_data: kv_data.clone(), agent: 0 };
+                    let t0 = Instant::now();
+                    black_box(sched.handle(&req)).unwrap();
+                    total += t0.elapsed();
+                }
+                total
+            });
+        });
+    }
+
+    group.finish();
+}
 
 fn bench_lookup_n_artifacts(_c: &mut Criterion) {}
 
