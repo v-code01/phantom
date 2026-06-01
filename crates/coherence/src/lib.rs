@@ -1,5 +1,6 @@
 pub(crate) mod engine;
 pub(crate) mod entry;
+pub(crate) mod routing;
 pub mod sync;
 pub use sync::SyncEngine;
 
